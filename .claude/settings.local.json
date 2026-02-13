@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(C:brainboostSubjective.venvScriptspython.exe -m pip install:*)",
+      "Bash(/c/brainboost/Subjective/.venv/Scripts/python.exe -m pip install:*)",
+      "Bash(/c/brainboost/Subjective/.venv/Scripts/python.exe:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push)"
+    ]
+  }
+}

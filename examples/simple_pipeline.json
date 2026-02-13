@@ -1,0 +1,26 @@
+{
+  "name": "SimpleVideoTranscription",
+  "description": "Simple pipeline: monitor folder -> transcribe videos",
+  "nodes": [
+    {
+      "node_id": "monitor",
+      "module": "SubjectiveLocalFolderMonitorDataSource",
+      "class": "SubjectiveLocalFolderMonitorDataSource",
+      "params": {
+        "url": "C:\\videos",
+        "connection_name": "VideoMonitor"
+      }
+    },
+    {
+      "node_id": "transcriber",
+      "module": "SubjectiveTranscribeLocalVideoDataSource",
+      "class": "SubjectiveTranscribeLocalVideoDataSource",
+      "params": {
+        "context_dir": "C:\\transcriptions",
+        "whisper_model_size": "base"
+      },
+      "dependencies": ["monitor"],
+      "filter": "data.get('event_type') == 'created' and str(data.get('path', '')).endswith(('.mp4', '.mkv'))"
+    }
+  ]
+}

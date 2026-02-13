@@ -1,0 +1,37 @@
+{% set name = "subjective-abstract-data-source-package" %}
+{% set version = "0.1.0" %}
+
+package:
+  name: {{ name|lower }}
+  version: {{ version }}
+
+source:
+  path: .
+
+build:
+  number: 0
+  noarch: python
+  script: {{ PYTHON }} -m pip install . -vv
+
+requirements:
+  host:
+    - python
+    - pip
+  run:
+    - python
+    - brainboost-data-source-logger-package
+    - brainboost-configuration-package
+    - pandas
+
+test:
+  imports:
+    - subjective_abstract_data_source_package
+    - subjective_abstract_data_source_package.SubjectiveDataSource
+    - subjective_abstract_data_source_package.SubjectiveRealTimeDataSource
+
+about:
+  home: https://github.com/brainboost/subjective-abstract-data-source-package
+  license: MIT
+  summary: Abstract base classes for building data source addons for BrainBoost data pipelines
+  doc_url: https://subjective-abstract-data-source-package.readthedocs.io/
+  dev_url: https://github.com/brainboost/subjective-abstract-data-source-package 

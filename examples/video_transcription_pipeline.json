@@ -1,0 +1,51 @@
+{
+  "name": "VideoTranscriptionPipeline",
+  "description": "Automatically transcribe video files when added to a monitored folder",
+  "nodes": [
+    {
+      "node_id": "local_videos_folder",
+      "module": "SubjectiveLocalFolderMonitorDataSource",
+      "class": "SubjectiveLocalFolderMonitorDataSource",
+      "params": {
+        "url": "C:\\brainboost\\videos",
+        "connection_name": "VideoFolderMonitor"
+      },
+      "dependencies": []
+    },
+    {
+      "node_id": "video_transcriber",
+      "module": "SubjectiveTranscribeLocalVideoDataSource",
+      "class": "SubjectiveTranscribeLocalVideoDataSource",
+      "params": {
+        "context_dir": "C:\\brainboost\\transcriptions",
+        "whisper_model_size": "base"
+      },
+      "dependencies": ["local_videos_folder"],
+      "filter": "data.get('event_type') == 'created' and str(data.get('path', '')).endswith(('.mp4', '.mkv'))",
+      "transform": "data"
+    }
+  ],
+  "workbench": {
+    "saved_at": "2026-01-09T16:00:00",
+    "nodes": [
+      {
+        "node_id": "local_videos_folder",
+        "position": {"x": 400, "y": 600},
+        "display_name": "Video Folder Monitor"
+      },
+      {
+        "node_id": "video_transcriber",
+        "position": {"x": 400, "y": 400},
+        "display_name": "Video Transcriber"
+      }
+    ],
+    "connections": [
+      {
+        "from_node": "video_transcriber",
+        "to_node": "local_videos_folder",
+        "from_point": "bottom",
+        "to_point": "top"
+      }
+    ]
+  }
+}

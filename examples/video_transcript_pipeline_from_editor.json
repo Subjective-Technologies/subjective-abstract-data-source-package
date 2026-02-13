@@ -1,0 +1,59 @@
+{
+  "name": "video_transcript_pipeline",
+  "description": "Moniotors the Videos folder for new videos, when there is a new video it transcribes the conversations",
+  "nodes": [
+    {
+      "node_id": "local_videos_monitor",
+      "module": "SubjectiveLocalFolderMonitorDataSource",
+      "class": "SubjectiveLocalFolderMonitorDataSource",
+      "params": {
+        "connection_name": "local_videos_monitor",
+        "url": "C:\\Users\\pablo\\Videos"
+      }
+    },
+    {
+      "node_id": "video_transcriber",
+      "module": "SubjectiveTranscribeLocalVideoDataSource",
+      "class": "SubjectiveTranscribeLocalVideoDataSource",
+      "params": {
+        "connection_name": "video_transcriber",
+        "videos_dir": "",
+        "context_dir": "",
+        "whisper_model_size": "",
+        "specific_video_path": ""
+      },
+      "dependencies": [
+        "local_videos_monitor"
+      ]
+    }
+  ],
+  "workbench": {
+    "saved_at": "2026-01-09T16:36:00",
+    "nodes": [
+      {
+        "node_id": "local_videos_monitor",
+        "position": {
+          "x": 503,
+          "y": 684
+        },
+        "display_name": "local_videos_monitor"
+      },
+      {
+        "node_id": "video_transcriber",
+        "position": {
+          "x": 520,
+          "y": 427
+        },
+        "display_name": "video_transcriber"
+      }
+    ],
+    "connections": [
+      {
+        "from_node": "video_transcriber",
+        "to_node": "local_videos_monitor",
+        "from_point": "bottom",
+        "to_point": "top"
+      }
+    ]
+  }
+}
