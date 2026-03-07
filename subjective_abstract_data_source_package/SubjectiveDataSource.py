@@ -6,6 +6,11 @@ import json
 from datetime import datetime
 from collections.abc import Iterable
 
+from .temp_storage import (
+    build_connection_tmp_dir,
+    build_process_tmp_root,
+)
+
 
 class SubjectiveDataSource(ABC):
     def __init_subclass__(cls, **kwargs):
@@ -98,6 +103,28 @@ class SubjectiveDataSource(ABC):
             return None
         return self._sanitize_label(connection_name)
 
+    def _get_runtime_connection_name(self):
+        if isinstance(self.params, dict):
+            connection_name = (
+                self.params.get("connection_name")
+                or self.params.get("connectionName")
+                or self.params.get("connection")
+            )
+            if connection_name:
+                return str(connection_name).strip()
+
+        for key in ("CONNECTION_NAME", "connection_name"):
+            value = self._safe_get_config_value(key)
+            if value:
+                return str(value).strip()
+
+        for key in ("CONNECTION_NAME", "connection_name"):
+            value = os.environ.get(key)
+            if value:
+                return str(value).strip()
+
+        return ""
+
     def _get_log_process_name(self):
         datasource_name = self.get_data_source_type_name()
         connection_label = self._get_connection_label()
@@ -110,6 +137,15 @@ class SubjectiveDataSource(ABC):
             return BBConfig.get(key)
         except Exception:
             return None
+
+    def _normalize_context_path(self, path_value):
+        path_text = "" if path_value is None else str(path_value).strip()
+        if not path_text:
+            return ""
+        path_text = os.path.expandvars(os.path.expanduser(path_text))
+        if not os.path.isabs(path_text):
+            path_text = os.path.abspath(path_text)
+        return os.path.normpath(path_text)
 
     def _ensure_context_params(self):
         if not isinstance(self.params, dict):
@@ -130,18 +166,65 @@ class SubjectiveDataSource(ABC):
 
     def _get_default_context_path(self):
         context_storage = self._safe_get_config_value("CONTEXT_STORAGE")
-        if context_storage:
-            return context_storage
-        return os.path.join("com_subjective_userdata", "com_subjective_context")
+        normalized_context_storage = self._normalize_context_path(context_storage)
+        if normalized_context_storage:
+            return normalized_context_storage
+
+        userdata_path = self._safe_get_config_value("USERDATA_PATH")
+        normalized_userdata_path = self._normalize_context_path(userdata_path)
+        if normalized_userdata_path:
+            return self._normalize_context_path(
+                os.path.join(normalized_userdata_path, "com_subjective_context")
+            )
+
+        return self._normalize_context_path(
+            os.path.join("~", ".Subjective", "com_subjective_userdata", "com_subjective_context")
+        )
 
     def _resolve_context_path(self):
         target_directory = self.params.get("TARGET_DIRECTORY")
         if target_directory:
-            return target_directory
+            normalized_target_directory = self._normalize_context_path(target_directory)
+            if normalized_target_directory:
+                return normalized_target_directory
         target_directory = self.params.get("target_directory")
         if target_directory:
-            return target_directory
+            normalized_target_directory = self._normalize_context_path(target_directory)
+            if normalized_target_directory:
+                return normalized_target_directory
         return self._get_default_context_path()
+
+    def get_connection_temp_dir(self):
+        tmp_root = ""
+        if isinstance(self.params, dict):
+            tmp_root = str(
+                self.params.get("ds_connection_tmp_space")
+                or self.params.get("DS_CONNECTION_TMP_SPACE")
+                or ""
+            ).strip()
+        if not tmp_root:
+            tmp_root = str(self._safe_get_config_value("DS_CONNECTION_TMP_SPACE") or "").strip()
+        if not tmp_root:
+            tmp_root = str(os.environ.get("DS_CONNECTION_TMP_SPACE") or "").strip()
+
+        connection_name = self._get_runtime_connection_name()
+        if not connection_name:
+            connection_name = f"connection_{os.getpid()}"
+
+        if not tmp_root:
+            fallback_root = build_process_tmp_root()
+            fallback_dir = build_connection_tmp_dir(fallback_root, connection_name)
+            os.makedirs(fallback_dir, exist_ok=True)
+            BBLogger.log(
+                "WARNING: [SubjectiveDataSource] DS_CONNECTION_TMP_SPACE missing; "
+                f"falling back to per-process temp dir: {fallback_dir}"
+            )
+            return fallback_dir
+
+        target_dir = build_connection_tmp_dir(tmp_root, connection_name)
+        os.makedirs(target_dir, exist_ok=True)
+        BBLogger.log(f"DEBUG: [SubjectiveDataSource] Connection temp dir: {target_dir}")
+        return target_dir
 
     def _write_context_output(self, data):
         context_dir = self._resolve_context_path()

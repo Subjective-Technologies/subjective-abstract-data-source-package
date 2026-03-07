@@ -31,6 +31,12 @@ class SubjectiveOnDemandDataSource(SubjectiveDataSource):
 
     def __init__(self, name=None, session=None, dependency_data_sources=None,
                  subscribers=None, params=None):
+        # Compatibility shim for plugins that still call:
+        #   super().__init__(name, params)
+        # In that call shape, `params` lands in `session` and would otherwise be lost.
+        if params is None and isinstance(session, dict) and dependency_data_sources is None and subscribers is None:
+            params = session
+            session = None
         super().__init__(
             name=name,
             session=session,
@@ -49,6 +55,8 @@ class SubjectiveOnDemandDataSource(SubjectiveDataSource):
         self._processing_thread: Optional[threading.Thread] = None
         self._processing_active: bool = False
         self._shutdown_event = threading.Event()
+        self._last_wait_log_time: float = 0.0
+        self._wait_log_interval: float = 60.0  # Log "waiting" at most every 60 seconds
 
         # Conversation history for chat-like interactions
         self._conversation_history: List[Dict[str, Any]] = []
@@ -267,8 +275,11 @@ class SubjectiveOnDemandDataSource(SubjectiveDataSource):
 
         while self._processing_active:
             try:
-                # Wait for a message with timeout
-                BBLogger.log(f"[{self.get_name()}] Waiting for message in queue...")
+                # Wait for a message with timeout (log at most every _wait_log_interval seconds)
+                now = time.time()
+                if now - self._last_wait_log_time >= self._wait_log_interval:
+                    BBLogger.log(f"[{self.get_name()}] Waiting for message in queue...")
+                    self._last_wait_log_time = now
                 message = self._message_queue.get(timeout=1.0)
                 BBLogger.log(f"[{self.get_name()}] Message retrieved from queue: {str(message)[:200]}...")
                 self._handle_message(message)

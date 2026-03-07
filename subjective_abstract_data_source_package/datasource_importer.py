@@ -99,7 +99,14 @@ def import_datasource_class(ds_class_name: str, project_root: Optional[str] = No
         BBLogger.log(f"Attempting to import from data_source_installed_plugins")
 
         # Get the plugins directory path
-        configured_plugins_dir = BBConfig.get("DATASOURCES_PLUGIN_PATH", "")
+        try:
+            configured_plugins_dir = BBConfig.get("DATASOURCES_PLUGIN_PATH", "")
+        except Exception as cfg_err:
+            BBLogger.log(
+                "BBConfig unavailable while resolving DATASOURCES_PLUGIN_PATH "
+                f"({cfg_err}); falling back to environment/default plugin path."
+            )
+            configured_plugins_dir = os.environ.get("DATASOURCES_PLUGIN_PATH", "")
         if configured_plugins_dir:
             configured_plugins_dir = os.path.expandvars(str(configured_plugins_dir))
             if "${USERDATA_PATH}" in configured_plugins_dir:
