@@ -1,53 +1,179 @@
-from abc import ABC, abstractmethod
-from brainboost_data_source_logger_package.BBLogger import BBLogger
-from brainboost_configuration_package.BBConfig import BBConfig
-import os
-import json
-from datetime import datetime
-from collections.abc import Iterable
+from __future__ import annotations
 
-from .temp_storage import (
-    build_connection_tmp_dir,
-    build_process_tmp_root,
-)
+from abc import ABC
+from collections.abc import Iterable
+from datetime import datetime
+import json
+import os
+from typing import Any
+
+from brainboost_configuration_package.BBConfig import BBConfig
+from brainboost_data_source_logger_package.BBLogger import BBLogger
+
+from .temp_storage import build_connection_tmp_dir, build_process_tmp_root
 
 
 class SubjectiveDataSource(ABC):
+    """
+    Subjective datasource base class.
+
+    The v2 API is:
+      - connection_schema()
+      - run(request)
+
+    The v1 API remains supported for backwards compatibility:
+      - get_connection_data()
+      - fetch()
+      - get_icon()
+    """
+
+    _subjective_api_version = "v1"
+
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
+
+        declares_v2 = any(
+            name in cls.__dict__
+            for name in ("connection_schema", "run", "stream", "handle_message")
+        )
+        declares_v1 = any(
+            name in cls.__dict__
+            for name in ("get_connection_data", "fetch", "get_icon", "_process_message")
+        )
+        inherited_version = getattr(cls, "_subjective_api_version", "v1")
+        if declares_v2:
+            cls._subjective_api_version = "v2"
+        elif declares_v1:
+            cls._subjective_api_version = "v1"
+        else:
+            cls._subjective_api_version = inherited_version
+
         original_fetch = cls.__dict__.get("fetch")
-        if original_fetch is None:
+        if original_fetch is None or getattr(original_fetch, "_subjective_wrapped_fetch", False):
             return
 
         def wrapped_fetch(self, *args, **kwargs):
             result = original_fetch(self, *args, **kwargs)
-            self._write_context_output_from_fetch(result)
+            try:
+                self._write_context_output_from_fetch(result)
+            except Exception as exc:
+                BBLogger.log(f"Failed writing fetch output for {self.__class__.__name__}: {exc}")
             return result
 
+        wrapped_fetch._subjective_wrapped_fetch = True  # type: ignore[attr-defined]
         cls.fetch = wrapped_fetch
 
-    def __init__(self, name=None, session=None, dependency_data_sources=[], subscribers=None, params=None):
-        self.name = name
-        self.session = session
-        self.dependency_data_sources = dependency_data_sources
-        self.subscribers = subscribers or []
-        self.params = params or {}
-        self._ensure_context_params()
-        self.progress_callback = None  # Initialize the progress callback to None
-        self.status_callback = None    # Initialize the status callback to None
-        self._progress_enabled = False
-        self._progress_bar_ctx = None
-        self._progress_bar = None
-        self._progress_bar_total = None
-        # progress variables normal to all datasources
-        self._total_items = 0
-        self._processed_items = 0
-        self._total_processing_time = 0.0
-        self._fetch_completed = False
-        self._configure_progress_from_params()
+    def __init__(self, *args, **kwargs):
+        if self._should_use_v2_init(args, kwargs):
+            connection = kwargs.pop("connection", args[0] if args else None)
+            config = kwargs.pop("config", args[1] if len(args) > 1 else None)
+            self._init_v2(connection=connection, config=config)
+            return
 
-        # Set unique BBLogger process name for this datasource
-        BBLogger._process_name = self._get_log_process_name()
+        self._init_v1(*args, **kwargs)
+
+    @classmethod
+    def api_version(cls) -> str:
+        return getattr(cls, "_subjective_api_version", "v1")
+
+    @classmethod
+    def is_v2_class(cls) -> bool:
+        return cls.api_version() == "v2"
+
+    @classmethod
+    def connection_schema(cls) -> dict:
+        if cls.is_v2_class():
+            raise NotImplementedError(f"{cls.__name__}.connection_schema() is not implemented")
+
+        definition = cls._legacy_connection_definition()
+        return cls._connection_definition_to_schema(definition)
+
+    @classmethod
+    def request_schema(cls) -> dict:
+        return {}
+
+    @classmethod
+    def output_schema(cls) -> dict:
+        return {}
+
+    @classmethod
+    def icon(cls) -> str:
+        if cls.is_v2_class():
+            return ""
+
+        instance = cls._build_metadata_instance()
+        if instance is None:
+            return ""
+        try:
+            return instance.get_icon() or ""
+        except Exception:
+            return ""
+
+    def run(self, request: dict) -> Any:
+        if not self.__class__.is_v2_class():
+            merged = dict(self.params or {})
+            if isinstance(request, dict):
+                merged.update(request)
+            self.params = merged
+            return self.fetch()
+        raise NotImplementedError(f"{self.__class__.__name__}.run() is not implemented")
+
+    def supports_streaming(self) -> bool:
+        return False
+
+    def stream(self, request: dict):
+        raise NotImplementedError("Streaming not supported by this datasource")
+
+    def supports_chat(self) -> bool:
+        return False
+
+    def handle_message(self, message: str, files: list | None = None) -> Any:
+        if not self.__class__.is_v2_class() and hasattr(self, "send_message"):
+            if files and hasattr(self, "send_message_with_files"):
+                return self.send_message_with_files(message, file_payloads=files)
+            return self.send_message(message)
+        raise NotImplementedError("Chat not supported by this datasource")
+
+    def fetch(self):
+        request = {}
+        if isinstance(self._config, dict):
+            config_request = self._config.get("request_data")
+            if isinstance(config_request, dict):
+                request.update(config_request)
+        if isinstance(self.params, dict):
+            request.update(self.params)
+        return self.run(request)
+
+    def get_icon(self) -> str:
+        return self.__class__.icon()
+
+    def get_connection_data(self) -> dict:
+        schema = self.__class__.connection_schema()
+        fields = self._schema_to_field_list(schema)
+        return {
+            "connection_type": self.get_data_source_type_name().upper() or self.__class__.__name__.upper(),
+            "connection_form": schema,
+            "fields": fields,
+        }
+
+    @property
+    def input_dir(self) -> str:
+        return str(self._config.get("input_dir", "") or "")
+
+    @property
+    def output_dir(self) -> str:
+        output_dir = str(self._config.get("output_dir", "") or "")
+        if output_dir:
+            return output_dir
+        return self._resolve_context_path()
+
+    @property
+    def scratch_dir(self) -> str:
+        return str(self._config.get("scratch_dir", "") or "")
+
+    @property
+    def connection_name(self) -> str:
+        return str(self._config.get("connection_name", "") or self._get_runtime_connection_name())
 
     def start(self):
         for ds in self.dependency_data_sources:
@@ -55,15 +181,16 @@ class SubjectiveDataSource(ABC):
             ds.start()
 
     def update(self, data):
-        # Treat each update as one processed item and emit progress updates.
         self.increment_processed_items()
         self._emit_progress()
         try:
             self._write_context_output(data)
-        except Exception as e:
-            BBLogger.log(f"Failed writing context output: {e}")
+        except Exception as exc:
+            BBLogger.log(f"Failed writing context output: {exc}")
         for subscriber in self.subscribers:
-            subscriber.notify(data)
+            notify = getattr(subscriber, "notify", None) or getattr(subscriber, "update", None)
+            if callable(notify):
+                notify(data)
 
     def subscribe(self, subscriber):
         if subscriber not in self.subscribers:
@@ -72,30 +199,34 @@ class SubjectiveDataSource(ABC):
 
     def get_name(self):
         class_name = self.__class__.__name__
-        if self.name:
-            return f"{self.name}_{class_name}"
+        runtime_name = self.connection_name or self.name
+        if runtime_name:
+            return f"{runtime_name}_{class_name}"
         return class_name
 
     def get_data_source_type_name(self):
-        """
-        Returns the name of the data source type by removing
-        'Subjective' and 'DataSource' substrings from the class name.
-        """
         class_name = self.__class__.__name__
-        data_source_type_name = class_name.replace('Subjective', '').replace('RealTimeDataSource', '').replace('DataSource', '')
+        data_source_type_name = (
+            class_name
+            .replace("Subjective", "")
+            .replace("RealTimeDataSource", "")
+            .replace("OnDemandDataSource", "")
+            .replace("PipelineDataSource", "Pipeline")
+            .replace("DataSource", "")
+        )
         return data_source_type_name
 
     def _sanitize_label(self, value):
-        return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in value)
+        return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(value))
 
     def _get_connection_label(self):
-        if not isinstance(self.params, dict):
-            return None
-        connection_name = (
-            self.params.get("connection_name")
-            or self.params.get("connectionName")
-            or self.params.get("connection")
-        )
+        connection_name = self.connection_name
+        if not connection_name and isinstance(self.params, dict):
+            connection_name = (
+                self.params.get("connection_name")
+                or self.params.get("connectionName")
+                or self.params.get("connection")
+            )
         if not connection_name:
             return None
         connection_name = str(connection_name).strip()
@@ -104,6 +235,11 @@ class SubjectiveDataSource(ABC):
         return self._sanitize_label(connection_name)
 
     def _get_runtime_connection_name(self):
+        if isinstance(self._config, dict):
+            connection_name = self._config.get("connection_name")
+            if connection_name:
+                return str(connection_name).strip()
+
         if isinstance(self.params, dict):
             connection_name = (
                 self.params.get("connection_name")
@@ -156,6 +292,13 @@ class SubjectiveDataSource(ABC):
             if value:
                 context_value = value
                 break
+        if not context_value and isinstance(self._config, dict):
+            context_value = (
+                self._config.get("context_dir")
+                or self._config.get("TARGET_DIRECTORY")
+                or self._config.get("target_directory")
+                or self._config.get("CONTEXT_DIR")
+            )
         if not context_value:
             context_value = self._get_default_context_path()
         if not context_value:
@@ -182,21 +325,31 @@ class SubjectiveDataSource(ABC):
         )
 
     def _resolve_context_path(self):
-        target_directory = self.params.get("TARGET_DIRECTORY")
-        if target_directory:
-            normalized_target_directory = self._normalize_context_path(target_directory)
-            if normalized_target_directory:
-                return normalized_target_directory
-        target_directory = self.params.get("target_directory")
-        if target_directory:
-            normalized_target_directory = self._normalize_context_path(target_directory)
-            if normalized_target_directory:
-                return normalized_target_directory
+        if isinstance(self._config, dict):
+            for key in ("output_dir", "context_dir", "TARGET_DIRECTORY", "target_directory", "CONTEXT_DIR"):
+                value = self._config.get(key)
+                if value:
+                    normalized = self._normalize_context_path(value)
+                    if normalized:
+                        return normalized
+        if isinstance(self.params, dict):
+            for key in ("TARGET_DIRECTORY", "target_directory", "context_dir", "CONTEXT_DIR"):
+                value = self.params.get(key)
+                if value:
+                    normalized = self._normalize_context_path(value)
+                    if normalized:
+                        return normalized
         return self._get_default_context_path()
 
     def get_connection_temp_dir(self):
         tmp_root = ""
-        if isinstance(self.params, dict):
+        if isinstance(self._config, dict):
+            tmp_root = str(
+                self._config.get("ds_connection_tmp_space")
+                or self._config.get("DS_CONNECTION_TMP_SPACE")
+                or ""
+            ).strip()
+        if not tmp_root and isinstance(self.params, dict):
             tmp_root = str(
                 self.params.get("ds_connection_tmp_space")
                 or self.params.get("DS_CONNECTION_TMP_SPACE")
@@ -207,9 +360,7 @@ class SubjectiveDataSource(ABC):
         if not tmp_root:
             tmp_root = str(os.environ.get("DS_CONNECTION_TMP_SPACE") or "").strip()
 
-        connection_name = self._get_runtime_connection_name()
-        if not connection_name:
-            connection_name = f"connection_{os.getpid()}"
+        connection_name = self._get_runtime_connection_name() or f"connection_{os.getpid()}"
 
         if not tmp_root:
             fallback_root = build_process_tmp_root()
@@ -228,6 +379,8 @@ class SubjectiveDataSource(ABC):
 
     def _write_context_output(self, data):
         context_dir = self._resolve_context_path()
+        if not context_dir:
+            return ""
         os.makedirs(context_dir, exist_ok=True)
 
         datasource_name = self.get_data_source_type_name()
@@ -238,7 +391,7 @@ class SubjectiveDataSource(ABC):
         connection_label = self._get_connection_label()
         if connection_label and "[connection_name]" not in name_convention:
             datasource_name = f"{datasource_name}-{connection_label}"
-        ts = datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
+        ts = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
         filename = name_convention.replace("YYYY_MM_DD_HH_MM_SS", ts)
         filename = filename.replace("[ds_name]", datasource_name)
         if "[connection_name]" in filename:
@@ -247,11 +400,15 @@ class SubjectiveDataSource(ABC):
         path = os.path.join(context_dir, filename)
 
         payload = data
+        if isinstance(payload, bytes):
+            with open(path, "wb") as fh:
+                fh.write(payload)
+            return path
         if not isinstance(payload, (dict, list)):
             payload = {"value": payload}
 
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(payload, f, indent=2, default=str)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, default=str)
         try:
             os.chmod(path, 0o666)
         except Exception:
@@ -270,56 +427,15 @@ class SubjectiveDataSource(ABC):
             return
         self._write_context_output(result)
 
-    # === Abstract methods that must be implemented by each data source ===
-    @abstractmethod
-    def fetch(self):
-        """Fetch data from the data source."""
-        pass
-
-    @abstractmethod
-    def get_icon(self) -> str:
-        """Return the SVG code for the data source icon."""
-        pass
-
-    @abstractmethod
-    def get_connection_data(self) -> dict:
-        """
-        Return the connection type and required fields for this data source.
-        This should return a dictionary with connection type and fields.
-        Example:
-        {
-            "connection_type": "AWS",
-            "fields": ["region", "access_key", "secret_key", "target_directory"]
-        }
-        """
-        pass
-
-    # === Progress Tracking Methods ===
-
     def set_progress_callback(self, callback):
-        """
-        Set a callback function to receive progress updates.
-        The callback should accept four arguments:
-        data_source_name, total_items, processed_items, estimated_time
-        """
         self.progress_callback = callback
         BBLogger.log(f"Progress callback set to: {callback}")
 
     def set_status_callback(self, callback):
-        """
-        Set a callback function to receive status updates.
-        The callback should accept two arguments:
-        data_source_name, status
-        """
         self.status_callback = callback
         BBLogger.log(f"Status callback set to: {callback}")
 
     def estimated_remaining_time(self):
-        """
-        Returns an estimate of the time required to process the remaining items.
-        Calculated as:
-          remaining_to_process() * average_time_per_item()
-        """
         remaining_to_process = self.remaining_to_process()
         if remaining_to_process is None:
             BBLogger.log("Total items unknown; cannot estimate remaining time")
@@ -341,11 +457,6 @@ class SubjectiveDataSource(ABC):
         return self._total_processing_time
 
     def remaining_to_process(self):
-        """
-        Returns the remaining number of items to process.
-        By default, this is calculated as:
-          total_to_process() - total_processed()
-        """
         total = self.get_total_to_process()
         if total <= 0:
             BBLogger.log("Total items unknown; remaining items cannot be computed")
@@ -393,16 +504,16 @@ class SubjectiveDataSource(ABC):
             if self._progress_bar:
                 try:
                     self._progress_bar()
-                except Exception as e:
-                    BBLogger.log(f"Progress bar update failed: {e}")
+                except Exception as exc:
+                    BBLogger.log(f"Progress bar update failed: {exc}")
         total_items = self.get_total_to_process()
         processed_items = self.get_total_processed()
         estimated_time = None if total_items <= 0 else self.estimated_remaining_time()
         if self.progress_callback:
             try:
                 self.progress_callback(self.get_name(), total_items, processed_items, estimated_time)
-            except Exception as e:
-                BBLogger.log(f"Progress callback failed: {e}")
+            except Exception as exc:
+                BBLogger.log(f"Progress callback failed: {exc}")
 
     def enable_progress_bar(self, enabled=True):
         self._progress_enabled = bool(enabled)
@@ -425,8 +536,8 @@ class SubjectiveDataSource(ABC):
             return
         try:
             from alive_progress import alive_bar
-        except Exception as e:
-            BBLogger.log(f"alive-progress not available: {e}")
+        except Exception as exc:
+            BBLogger.log(f"alive-progress not available: {exc}")
             self._progress_enabled = False
             return
 
@@ -451,8 +562,147 @@ class SubjectiveDataSource(ABC):
             return
         try:
             self._progress_bar_ctx.__exit__(None, None, None)
-        except Exception as e:
-            BBLogger.log(f"Failed to close progress bar: {e}")
+        except Exception as exc:
+            BBLogger.log(f"Failed to close progress bar: {exc}")
         self._progress_bar_ctx = None
         self._progress_bar = None
         self._progress_bar_total = None
+
+    def _should_use_v2_init(self, args, kwargs) -> bool:
+        if "connection" in kwargs or "config" in kwargs:
+            return True
+        if kwargs:
+            return False
+        if not args or len(args) > 2:
+            return False
+        first = args[0]
+        second = args[1] if len(args) > 1 else None
+        return (
+            (first is None or isinstance(first, dict))
+            and (second is None or isinstance(second, dict))
+        )
+
+    def _init_v2(self, connection=None, config=None):
+        self.name = ""
+        self.session = None
+        self.dependency_data_sources = []
+        self.subscribers = []
+        self.params = {}
+        self._connection = dict(connection or {})
+        self._config = dict(config or {})
+        self.progress_callback = None
+        self.status_callback = None
+        self._progress_enabled = False
+        self._progress_bar_ctx = None
+        self._progress_bar = None
+        self._progress_bar_total = None
+        self._total_items = 0
+        self._processed_items = 0
+        self._total_processing_time = 0.0
+        self._fetch_completed = False
+        BBLogger._process_name = self._get_log_process_name()
+
+    def _init_v1(self, *args, **kwargs):
+        if args:
+            values = list(args) + [None] * 5
+            name, session, dependency_data_sources, subscribers, params = values[:5]
+        else:
+            name = kwargs.get("name")
+            session = kwargs.get("session")
+            dependency_data_sources = kwargs.get("dependency_data_sources")
+            subscribers = kwargs.get("subscribers")
+            params = kwargs.get("params")
+
+        if (
+            params is None
+            and isinstance(session, dict)
+            and dependency_data_sources is None
+            and subscribers is None
+        ):
+            params = session
+            session = None
+
+        self.name = name
+        self.session = session
+        self.dependency_data_sources = list(dependency_data_sources or [])
+        self.subscribers = list(subscribers or [])
+        self.params = dict(params or {})
+        self._connection = {}
+        self._config = {}
+        self._ensure_context_params()
+        self.progress_callback = None
+        self.status_callback = None
+        self._progress_enabled = False
+        self._progress_bar_ctx = None
+        self._progress_bar = None
+        self._progress_bar_total = None
+        self._total_items = 0
+        self._processed_items = 0
+        self._total_processing_time = 0.0
+        self._fetch_completed = False
+        self._configure_progress_from_params()
+        BBLogger._process_name = self._get_log_process_name()
+
+    @classmethod
+    def _build_metadata_instance(cls):
+        try:
+            return cls(params={})
+        except Exception:
+            try:
+                return cls()
+            except Exception:
+                return None
+
+    @classmethod
+    def _legacy_connection_definition(cls) -> dict:
+        instance = cls._build_metadata_instance()
+        if instance is None:
+            return {}
+        try:
+            data = instance.get_connection_data() or {}
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    @classmethod
+    def _connection_definition_to_schema(cls, definition: dict) -> dict:
+        if not isinstance(definition, dict):
+            return {}
+        if isinstance(definition.get("connection_form"), dict):
+            return definition.get("connection_form") or {}
+
+        schema = {}
+        fields = definition.get("fields", [])
+        if not isinstance(fields, list):
+            return {}
+        for field in fields:
+            if isinstance(field, str):
+                schema[field] = {
+                    "type": "text",
+                    "label": field.replace("_", " ").title(),
+                }
+                continue
+            if not isinstance(field, dict):
+                continue
+            name = str(field.get("name") or "").strip()
+            if not name:
+                continue
+            spec = dict(field)
+            spec.pop("name", None)
+            spec.setdefault("type", "text")
+            spec.setdefault("label", name.replace("_", " ").title())
+            schema[name] = spec
+        return schema
+
+    @staticmethod
+    def _schema_to_field_list(schema: dict) -> list[dict]:
+        if not isinstance(schema, dict):
+            return []
+        fields = []
+        for name, spec in schema.items():
+            if not isinstance(spec, dict):
+                spec = {"type": "text", "label": str(name).replace("_", " ").title()}
+            field = {"name": name}
+            field.update(spec)
+            fields.append(field)
+        return fields
