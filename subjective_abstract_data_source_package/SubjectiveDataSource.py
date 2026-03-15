@@ -3,14 +3,24 @@ from __future__ import annotations
 from abc import ABC
 from collections.abc import Iterable
 from datetime import datetime
+import inspect
 import json
 import os
+import time
 from typing import Any
+import warnings
 
 from brainboost_configuration_package.BBConfig import BBConfig
 from brainboost_data_source_logger_package.BBLogger import BBLogger
 
 from .temp_storage import build_connection_tmp_dir, build_process_tmp_root
+
+
+_DEPRECATED_V1_WRAPPERS = {
+    "SubjectiveOnDemandDataSource",
+    "SubjectiveRealTimeDataSource",
+    "SubjectivePipelineDataSource",
+}
 
 
 class SubjectiveDataSource(ABC):
@@ -32,6 +42,7 @@ class SubjectiveDataSource(ABC):
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
 
+        is_wrapper_class = cls.__name__ in _DEPRECATED_V1_WRAPPERS
         declares_v2 = any(
             name in cls.__dict__
             for name in ("connection_schema", "run", "stream", "handle_message")
@@ -41,12 +52,32 @@ class SubjectiveDataSource(ABC):
             for name in ("get_connection_data", "fetch", "get_icon", "_process_message")
         )
         inherited_version = getattr(cls, "_subjective_api_version", "v1")
-        if declares_v2:
+        if is_wrapper_class:
+            cls._subjective_api_version = "v1"
+        elif declares_v2 and not declares_v1:
             cls._subjective_api_version = "v2"
         elif declares_v1:
             cls._subjective_api_version = "v1"
         else:
             cls._subjective_api_version = inherited_version
+
+        is_candidate_v2 = (
+            not is_wrapper_class
+            and "fetch" not in cls.__dict__
+            and "get_connection_data" not in cls.__dict__
+            and cls.api_version() == "v2"
+        )
+        if is_candidate_v2 and not inspect.isabstract(cls):
+            if "run" not in cls.__dict__:
+                raise TypeError(
+                    f"{cls.__name__} must implement run(self, request) "
+                    "— see 26_datasource_api_v2_refactor.md section 2.1"
+                )
+            if "connection_schema" not in cls.__dict__:
+                raise TypeError(
+                    f"{cls.__name__} must implement connection_schema(cls) "
+                    "— see 26_datasource_api_v2_refactor.md section 2.1"
+                )
 
         original_fetch = cls.__dict__.get("fetch")
         if original_fetch is None or getattr(original_fetch, "_subjective_wrapped_fetch", False):
@@ -64,10 +95,35 @@ class SubjectiveDataSource(ABC):
         cls.fetch = wrapped_fetch
 
     def __init__(self, *args, **kwargs):
-        if self._should_use_v2_init(args, kwargs):
-            connection = kwargs.pop("connection", args[0] if args else None)
-            config = kwargs.pop("config", args[1] if len(args) > 1 else None)
+        v1_kwarg_keys = {
+            "name",
+            "session",
+            "dependency_data_sources",
+            "subscribers",
+            "params",
+        }
+
+        if "connection" in kwargs:
+            connection = kwargs.pop("connection")
+            config = kwargs.pop("config", None)
             self._init_v2(connection=connection, config=config)
+            return
+        if "name" in kwargs or len(args) >= 3:
+            self._init_v1(*args, **kwargs)
+            return
+        if len(args) == 1 and isinstance(args[0], dict) and not any(key in kwargs for key in v1_kwarg_keys):
+            self._init_v2(connection=args[0], config=kwargs.pop("config", None))
+            return
+        if (
+            len(args) == 2
+            and isinstance(args[0], dict)
+            and isinstance(args[1], dict)
+            and not any(key in kwargs for key in v1_kwarg_keys)
+        ):
+            self._init_v2(connection=args[0], config=args[1])
+            return
+        if not args and set(kwargs.keys()) <= {"params"}:
+            self._init_v1(*args, **kwargs)
             return
 
         self._init_v1(*args, **kwargs)
@@ -101,13 +157,17 @@ class SubjectiveDataSource(ABC):
         if cls.is_v2_class():
             return ""
 
-        instance = cls._build_metadata_instance()
+        instance = cls._extract_v1_metadata()
         if instance is None:
             return ""
         try:
             return instance.get_icon() or ""
         except Exception:
-            return ""
+            try:
+                fallback_instance = cls(params={})
+                return fallback_instance.get_icon() or ""
+            except Exception:
+                return ""
 
     def run(self, request: dict) -> Any:
         if not self.__class__.is_v2_class():
@@ -175,12 +235,27 @@ class SubjectiveDataSource(ABC):
     def connection_name(self) -> str:
         return str(self._config.get("connection_name", "") or self._get_runtime_connection_name())
 
+    @connection_name.setter
+    def connection_name(self, value):
+        if not isinstance(getattr(self, "_config", None), dict):
+            self._config = {}
+        self._config["connection_name"] = str(value) if value else ""
+
+    # ==================================================================
+    # v1 backward-compatibility methods
+    # These exist only for legacy SubjectiveDataSource v1 subclasses.
+    # v2 datasources should not use these; the framework handles
+    # subscribers, context output, and progress externally.
+    # ==================================================================
+
     def start(self):
+        self._warn_if_v2_uses_v1_method("start")
         for ds in self.dependency_data_sources:
             ds.subscribe(self)
             ds.start()
 
     def update(self, data):
+        self._warn_if_v2_uses_v1_method("update")
         self.increment_processed_items()
         self._emit_progress()
         try:
@@ -192,7 +267,56 @@ class SubjectiveDataSource(ABC):
             if callable(notify):
                 notify(data)
 
+    def send_notification(self, notification_data):
+        """
+        Send a notification to all subscribers with the provided data.
+        Adds a timestamp if not present, then delegates to update().
+
+        This is the preferred method for datasources to emit real-time events.
+        """
+        try:
+            if isinstance(notification_data, dict) and "timestamp" not in notification_data:
+                notification_data["timestamp"] = time.time()
+            self.update(notification_data)
+        except Exception as exc:
+            BBLogger.log(f"Error sending notification: {exc}")
+
+    def send_redis_notification(self, channel, notification_data):
+        """
+        Publish notification data to a Redis channel.
+
+        Uses BBConfig for Redis connection details. Falls back gracefully
+        if Redis is not available (e.g., during testing or isolated execution).
+        """
+        try:
+            import redis as redis_lib
+
+            redis_host = "localhost"
+            redis_port = 6379
+            try:
+                redis_host = str(BBConfig.get("REDIS_SERVER_IP", "localhost"))
+            except Exception:
+                pass
+            try:
+                redis_port = int(BBConfig.get("REDIS_SERVER_PORT", 6379))
+            except Exception:
+                pass
+
+            client = redis_lib.Redis(host=redis_host, port=redis_port, db=0)
+
+            if isinstance(notification_data, dict) and "timestamp" not in notification_data:
+                notification_data["timestamp"] = time.time()
+
+            client.publish(channel, json.dumps(notification_data, default=str))
+            BBLogger.log(f"Sent Redis notification to channel '{channel}'")
+
+        except ImportError:
+            BBLogger.log("Redis not available for notifications")
+        except Exception as exc:
+            BBLogger.log(f"Error sending Redis notification: {exc}")
+
     def subscribe(self, subscriber):
+        self._warn_if_v2_uses_v1_method("subscribe")
         if subscriber not in self.subscribers:
             self.subscribers.append(subscriber)
             BBLogger.log(f"Subscriber {subscriber} added.")
@@ -325,6 +449,7 @@ class SubjectiveDataSource(ABC):
         )
 
     def _resolve_context_path(self):
+        self._warn_if_v2_uses_v1_method("_resolve_context_path")
         if isinstance(self._config, dict):
             for key in ("output_dir", "context_dir", "TARGET_DIRECTORY", "target_directory", "CONTEXT_DIR"):
                 value = self._config.get(key)
@@ -377,7 +502,17 @@ class SubjectiveDataSource(ABC):
         BBLogger.log(f"DEBUG: [SubjectiveDataSource] Connection temp dir: {target_dir}")
         return target_dir
 
+    def _warn_if_v2_uses_v1_method(self, method_name: str):
+        if getattr(self, "_subjective_api_version", "v1") != "v1":
+            warnings.warn(
+                f"{self.__class__.__name__}.{method_name}() is a v1 method. "
+                "v2 datasources should not call it directly.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
     def _write_context_output(self, data):
+        self._warn_if_v2_uses_v1_method("_write_context_output")
         context_dir = self._resolve_context_path()
         if not context_dir:
             return ""
@@ -416,6 +551,7 @@ class SubjectiveDataSource(ABC):
         return path
 
     def _write_context_output_from_fetch(self, result):
+        self._warn_if_v2_uses_v1_method("_write_context_output_from_fetch")
         if result is None:
             return
         if isinstance(result, (dict, list, str, bytes)):
@@ -428,14 +564,17 @@ class SubjectiveDataSource(ABC):
         self._write_context_output(result)
 
     def set_progress_callback(self, callback):
+        self._warn_if_v2_uses_v1_method("set_progress_callback")
         self.progress_callback = callback
         BBLogger.log(f"Progress callback set to: {callback}")
 
     def set_status_callback(self, callback):
+        self._warn_if_v2_uses_v1_method("set_status_callback")
         self.status_callback = callback
         BBLogger.log(f"Status callback set to: {callback}")
 
     def estimated_remaining_time(self):
+        self._warn_if_v2_uses_v1_method("estimated_remaining_time")
         remaining_to_process = self.remaining_to_process()
         if remaining_to_process is None:
             BBLogger.log("Total items unknown; cannot estimate remaining time")
@@ -445,18 +584,22 @@ class SubjectiveDataSource(ABC):
         return remaining
 
     def get_total_to_process(self):
+        self._warn_if_v2_uses_v1_method("get_total_to_process")
         BBLogger.log(f"Getting total items to process: {self._total_items}")
         return self._total_items
 
     def get_total_processed(self):
+        self._warn_if_v2_uses_v1_method("get_total_processed")
         BBLogger.log(f"Getting total processed items: {self._processed_items}")
         return self._processed_items
 
     def get_total_processing_time(self):
+        self._warn_if_v2_uses_v1_method("get_total_processing_time")
         BBLogger.log(f"Getting total processing time: {self._total_processing_time} seconds")
         return self._total_processing_time
 
     def remaining_to_process(self):
+        self._warn_if_v2_uses_v1_method("remaining_to_process")
         total = self.get_total_to_process()
         if total <= 0:
             BBLogger.log("Total items unknown; remaining items cannot be computed")
@@ -466,31 +609,37 @@ class SubjectiveDataSource(ABC):
         return remaining
 
     def increment_processed_items(self):
+        self._warn_if_v2_uses_v1_method("increment_processed_items")
         new_processed = self.get_total_processed() + 1
         self.set_processed_items(new_processed)
         BBLogger.log(f"Incremented processed items to: {new_processed}")
 
     def set_total_items(self, total_items):
+        self._warn_if_v2_uses_v1_method("set_total_items")
         self._total_items = total_items
         BBLogger.log(f"Set total items to: {total_items}")
         if self._progress_enabled:
             self._ensure_progress_bar(restart_if_unknown=True)
 
     def set_processed_items(self, processed_items):
+        self._warn_if_v2_uses_v1_method("set_processed_items")
         self._processed_items = processed_items
         BBLogger.log(f"Set processed items to: {processed_items}")
 
     def set_total_processing_time(self, total_processing_time):
+        self._warn_if_v2_uses_v1_method("set_total_processing_time")
         self._total_processing_time = total_processing_time
         BBLogger.log(f"Set total processing time to: {total_processing_time} seconds")
 
     def set_fetch_completed(self, fetch_completed=False):
+        self._warn_if_v2_uses_v1_method("set_fetch_completed")
         self._fetch_completed = fetch_completed
         BBLogger.log(f"Set fetch completed to: {fetch_completed}")
         if fetch_completed:
             self._close_progress_bar()
 
     def average_time_per_item(self):
+        self._warn_if_v2_uses_v1_method("average_time_per_item")
         if self.get_total_processed() == 0:
             BBLogger.log("No items processed yet; average time per item is 0.0 seconds")
             return 0.0
@@ -499,6 +648,7 @@ class SubjectiveDataSource(ABC):
         return avg
 
     def _emit_progress(self):
+        self._warn_if_v2_uses_v1_method("_emit_progress")
         if self._progress_enabled:
             self._ensure_progress_bar()
             if self._progress_bar:
@@ -516,6 +666,7 @@ class SubjectiveDataSource(ABC):
                 BBLogger.log(f"Progress callback failed: {exc}")
 
     def enable_progress_bar(self, enabled=True):
+        self._warn_if_v2_uses_v1_method("enable_progress_bar")
         self._progress_enabled = bool(enabled)
         if self._progress_enabled:
             self._ensure_progress_bar()
@@ -523,6 +674,7 @@ class SubjectiveDataSource(ABC):
             self._close_progress_bar()
 
     def _configure_progress_from_params(self):
+        self._warn_if_v2_uses_v1_method("_configure_progress_from_params")
         progress_flag = False
         if isinstance(self.params, dict):
             progress_flag = bool(self.params.get("progress") or self.params.get("--progress"))
@@ -532,6 +684,7 @@ class SubjectiveDataSource(ABC):
             self.enable_progress_bar(True)
 
     def _ensure_progress_bar(self, restart_if_unknown=False):
+        self._warn_if_v2_uses_v1_method("_ensure_progress_bar")
         if not self._progress_enabled:
             return
         try:
@@ -558,6 +711,7 @@ class SubjectiveDataSource(ABC):
         self._progress_bar_total = total
 
     def _close_progress_bar(self):
+        self._warn_if_v2_uses_v1_method("_close_progress_bar")
         if not self._progress_bar_ctx:
             return
         try:
@@ -568,21 +722,8 @@ class SubjectiveDataSource(ABC):
         self._progress_bar = None
         self._progress_bar_total = None
 
-    def _should_use_v2_init(self, args, kwargs) -> bool:
-        if "connection" in kwargs or "config" in kwargs:
-            return True
-        if kwargs:
-            return False
-        if not args or len(args) > 2:
-            return False
-        first = args[0]
-        second = args[1] if len(args) > 1 else None
-        return (
-            (first is None or isinstance(first, dict))
-            and (second is None or isinstance(second, dict))
-        )
-
     def _init_v2(self, connection=None, config=None):
+        self._subjective_api_version = "v2"
         self.name = ""
         self.session = None
         self.dependency_data_sources = []
@@ -603,6 +744,7 @@ class SubjectiveDataSource(ABC):
         BBLogger._process_name = self._get_log_process_name()
 
     def _init_v1(self, *args, **kwargs):
+        self._subjective_api_version = "v1"
         if args:
             values = list(args) + [None] * 5
             name, session, dependency_data_sources, subscribers, params = values[:5]
@@ -644,25 +786,51 @@ class SubjectiveDataSource(ABC):
         BBLogger._process_name = self._get_log_process_name()
 
     @classmethod
-    def _build_metadata_instance(cls):
+    def _extract_v1_metadata(cls, ds_class=None):
+        ds_class = ds_class or cls
         try:
-            return cls(params={})
+            bare = ds_class.__new__(ds_class)
+            bare.params = {}
+            bare.name = ds_class.__name__
+            bare.session = None
+            bare.subscribers = []
+            bare.dependency_data_sources = []
+            bare._connection = {}
+            bare._config = {}
+            bare.progress_callback = None
+            bare.status_callback = None
+            bare._progress_enabled = False
+            bare._progress_bar_ctx = None
+            bare._progress_bar = None
+            bare._progress_bar_total = None
+            bare._total_items = 0
+            bare._processed_items = 0
+            bare._total_processing_time = 0.0
+            bare._fetch_completed = False
+            bare._subjective_api_version = "v1"
+            return bare
         except Exception:
-            try:
-                return cls()
-            except Exception:
-                return None
+            pass
+        try:
+            return ds_class(params={})
+        except Exception:
+            return None
 
     @classmethod
     def _legacy_connection_definition(cls) -> dict:
-        instance = cls._build_metadata_instance()
+        instance = cls._extract_v1_metadata()
         if instance is None:
             return {}
         try:
             data = instance.get_connection_data() or {}
             return data if isinstance(data, dict) else {}
         except Exception:
-            return {}
+            try:
+                fallback_instance = cls(params={})
+                data = fallback_instance.get_connection_data() or {}
+                return data if isinstance(data, dict) else {}
+            except Exception:
+                return {}
 
     @classmethod
     def _connection_definition_to_schema(cls, definition: dict) -> dict:
