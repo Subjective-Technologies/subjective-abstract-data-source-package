@@ -42,7 +42,7 @@ setup(
     version=get_version(),
     author="Pablo Tomas Borda",
     author_email="pablo.borda@subjectivetechnologies.com",
-    description="Abstract base classes for building data source addons for BrainBoost data pipelines",
+    description="Subjective datasource v2 base classes with separated connection/request schemas and pipeline support",
     long_description=read_readme(),
     long_description_content_type="text/markdown",
     url="https://github.com/brainboost/subjective-abstract-data-source-package",
@@ -85,4 +85,3 @@ setup(
     include_package_data=True,
     zip_safe=False,
 ) 
-

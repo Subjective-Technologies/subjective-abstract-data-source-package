@@ -16,7 +16,7 @@ from .SubjectiveOnDemandDataSource import SubjectiveOnDemandDataSource
 from .SubjectivePipelineDataSource import SubjectiveDataSourcePipeline, PipelineNode, PipelineAdapter
 from .SubjectivePipelineDataSource import SubjectivePipelineDataSource
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 __author__ = "Pablo Tomas Borda"
 __email__ = "pablo.borda@subjectivetechnologies.com"
 
