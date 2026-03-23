@@ -145,11 +145,33 @@ class SubjectiveDataSource(ABC):
         return cls._connection_definition_to_schema(definition)
 
     @classmethod
+    def actions(cls) -> dict:
+        return {}
+
+    @classmethod
+    def action_schema(cls, action_name: str) -> dict:
+        return cls.actions().get(action_name, {})
+
+    @classmethod
     def request_schema(cls) -> dict:
+        acts = cls.actions()
+        if acts:
+            merged = {}
+            for action_def in acts.values():
+                if isinstance(action_def, dict):
+                    merged.update(action_def.get("request", {}))
+            return merged
         return {}
 
     @classmethod
     def output_schema(cls) -> dict:
+        acts = cls.actions()
+        if acts:
+            merged = {}
+            for action_def in acts.values():
+                if isinstance(action_def, dict):
+                    merged.update(action_def.get("output", {}))
+            return merged
         return {}
 
     @classmethod
