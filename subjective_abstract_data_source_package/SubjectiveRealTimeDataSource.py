@@ -37,7 +37,23 @@ class SubjectiveRealTimeDataSource(SubjectiveDataSource):
         self._reconnect_max_attempts = self._coerce_int_param("reconnect_max_attempts", -1)
 
     def supports_streaming(self) -> bool:
-        return True
+        """Returns True only if this subclass can actually stream."""
+        if "stream" in type(self).__dict__ and type(self).__dict__["stream"] is not SubjectiveRealTimeDataSource.stream:
+            return True
+        if (
+            hasattr(self, "_connect_stream")
+            and callable(getattr(self, "_connect_stream"))
+            and hasattr(self, "_run_stream")
+            and callable(getattr(self, "_run_stream"))
+        ):
+            return True
+        if (
+            "_start_monitoring_implementation" in type(self).__dict__
+            and type(self).__dict__["_start_monitoring_implementation"]
+            is not SubjectiveRealTimeDataSource._start_monitoring_implementation
+        ):
+            return True
+        return False
 
     def stream(self, request: dict):
         raise NotImplementedError("Streaming not supported by this datasource")

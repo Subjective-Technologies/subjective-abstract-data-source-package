@@ -352,6 +352,71 @@ def test_v2_output_schema_defaults_empty():
     assert DefaultOutputSchemaV2DataSource.output_schema() == {}
 
 
+def test_v2_actions_auto_generate_request_and_output_schema():
+    class ActionBackedV2DataSource(SubjectiveDataSource):
+        @classmethod
+        def connection_schema(cls):
+            return {"token": {"type": "password"}}
+
+        @classmethod
+        def actions(cls):
+            return {
+                "Create": {
+                    "request": {
+                        "prompt": {"type": "text"},
+                    },
+                    "output": {
+                        "task_id": {"type": "text"},
+                    },
+                },
+                "Status": {
+                    "request": {
+                        "task_id": {"type": "text"},
+                    },
+                    "output": {
+                        "status": {"type": "text"},
+                    },
+                },
+            }
+
+        def run(self, request):
+            return request
+
+    assert ActionBackedV2DataSource.request_schema() == {
+        "prompt": {"type": "text"},
+        "task_id": {"type": "text"},
+    }
+    assert ActionBackedV2DataSource.output_schema() == {
+        "task_id": {"type": "text"},
+        "status": {"type": "text"},
+    }
+
+
+def test_v2_action_schema_returns_specific_action():
+    class ActionSchemaV2DataSource(SubjectiveDataSource):
+        @classmethod
+        def connection_schema(cls):
+            return {}
+
+        @classmethod
+        def actions(cls):
+            return {
+                "Create": {
+                    "request": {"prompt": {"type": "text"}},
+                    "output": {"task_id": {"type": "text"}},
+                }
+            }
+
+        def run(self, request):
+            return request
+
+    assert ActionSchemaV2DataSource.action_schema("Create") == {
+        "request": {"prompt": {"type": "text"}},
+        "output": {"task_id": {"type": "text"}},
+    }
+    assert ActionSchemaV2DataSource.action_schema("Missing") == {}
+
+
 def test_v2_run_called_directly():
     class RunEchoV2DataSource(SubjectiveDataSource):
         @classmethod

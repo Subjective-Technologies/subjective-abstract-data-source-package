@@ -9,10 +9,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+import copy
 import importlib
 import inspect
 import json
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -417,12 +419,17 @@ class _V2PipelineNode:
     class_name: str
     connection_name: str
     inputs: Dict[str, Any] = field(default_factory=dict)
+    selected_action: str = ""
     terminal: bool = False
     dependencies: List[str] = field(default_factory=list)
     filter_expr: str = ""
     transform_expr: str = ""
     data_source_class: Any = None
     instance: Any = None
+
+
+_SKIP_PIPELINE_NODE = object()
+_SKIP_PIPELINE_INPUT = object()
 
 
 class _SubjectiveDataSourcePipelineRunner:
@@ -445,42 +452,90 @@ class _SubjectiveDataSourcePipelineRunner:
         self.nodes: Dict[str, _V2PipelineNode] = {}
         self._connection_records = self._load_connection_records()
         self._started = False
+        self._iterated_nodes: set[str] = set()
+        self._workflow_start_node_ids: set[str] = set()
+        self._workflow_end_node_ids: set[str] = set()
+        self._workflow_iterator_nodes: Dict[str, Dict[str, Any]] = {}
+        self._stream_threads: List[threading.Thread] = []
         self._build_nodes()
 
+    def _crash_log(self, msg):
+        """Write directly to a crash log file, bypassing BBLogger's async queue."""
+        try:
+            log_dir = os.path.dirname(BBLogger._get_log_file_path() or "")
+            if not log_dir:
+                log_dir = os.path.expanduser("~")
+            crash_path = os.path.join(log_dir, "pipeline_crash_debug.log")
+            with open(crash_path, "a", encoding="utf-8") as f:
+                from datetime import datetime
+                f.write(f"{datetime.now().isoformat()} | {msg}\n")
+                f.flush()
+        except Exception:
+            pass
+
     def build(self):
+        self._crash_log(f"build() entered. workspace={self.workspace_root}")
+        BBLogger.log(f"[Pipeline:build] Creating workspace at {self.workspace_root}")
         os.makedirs(self.workspace_root, exist_ok=True)
         for node in self.nodes.values():
             self._ensure_node_dirs(node.node_id)
             if node.instance is None:
-                node.instance = self._instantiate_node(node)
+                class_name = getattr(node.data_source_class, "__name__", str(node.data_source_class))
+                try:
+                    self._crash_log(f"Instantiating {node.node_id} ({class_name})")
+                    BBLogger.log(f"[Pipeline:build] Instantiating {node.node_id} ({class_name})")
+                    node.instance = self._instantiate_node(node)
+                    self._crash_log(f"{node.node_id} instantiated OK")
+                    BBLogger.log(f"[Pipeline:build] {node.node_id} instantiated OK")
+                except Exception as exc:
+                    msg = (
+                        f"FAILED to instantiate {node.node_id} ({class_name}): "
+                        f"{exc}\n{traceback.format_exc()}"
+                    )
+                    self._crash_log(msg)
+                    BBLogger.log(f"[Pipeline:build] {msg}")
+                    raise
         self._started = True
+        self._crash_log(f"All {len(self.nodes)} nodes instantiated. Build complete.")
+        BBLogger.log(f"[Pipeline:build] All {len(self.nodes)} nodes instantiated. Build complete.")
         return self
 
     def start(self, request: Optional[Dict[str, Any]] = None):
-        return self.run(request or {})
+        request_payload = dict(request or {})
+        BBLogger.log(
+            f"[Pipeline:start] Starting pipeline '{self.pipeline_name}' "
+            f"with request keys={sorted(request_payload.keys())}"
+        )
+        return self.run(request_payload)
 
     def run(self, request: Optional[Dict[str, Any]] = None):
         if not self._started:
+            BBLogger.log("[Pipeline:run] Runner not built yet. Calling build().")
             self.build()
 
         initial_request = dict(request or {})
         results: Dict[str, Any] = {}
-
-        for node_id in self._topological_order():
+        topological_order = self._topological_order()
+        streaming_nodes: List[_V2PipelineNode] = []
+        batch_order: List[str] = []
+        for node_id in topological_order:
             node = self.nodes[node_id]
-            node_request = self._build_request_for_node(node, results, initial_request)
-            result = self._execute_node(node, node_request)
-            results[node_id] = result
-            self._route_output_files(node)
+            if self._is_streaming_node(node):
+                streaming_nodes.append(node)
+            else:
+                batch_order.append(node_id)
 
-        terminal_nodes = [n.node_id for n in self.nodes.values() if n.terminal]
-        if not terminal_nodes and self.nodes:
-            terminal_nodes = [self._topological_order()[-1]]
-        if len(terminal_nodes) == 1:
-            return results.get(terminal_nodes[0])
-        return {node_id: results.get(node_id) for node_id in terminal_nodes}
+        BBLogger.log(f"[Pipeline:run] Topological order: {topological_order}")
+        BBLogger.log(f"[Pipeline:run] Streaming nodes: {[node.node_id for node in streaming_nodes]}")
+        BBLogger.log(f"[Pipeline:run] Batch nodes: {batch_order}")
+        if not streaming_nodes:
+            BBLogger.log("[Pipeline:run] No streaming nodes detected. Running batch-only mode.")
+            return self._run_batch(initial_request, results, topological_order)
+        BBLogger.log("[Pipeline:run] Streaming nodes detected. Running event-driven mode.")
+        return self._run_event_driven(initial_request, results, streaming_nodes, batch_order)
 
     def stop(self):
+        self._started = False
         for node in self.nodes.values():
             if node.instance and hasattr(node.instance, "stop"):
                 try:
@@ -491,6 +546,260 @@ class _SubjectiveDataSourcePipelineRunner:
     def get_node_instance(self, node_id: str):
         node = self.nodes.get(node_id)
         return node.instance if node else None
+
+    def _run_batch(
+        self,
+        initial_request: Dict[str, Any],
+        results: Dict[str, Any],
+        node_order: Optional[List[str]] = None,
+    ):
+        self._run_batch_nodes(node_order or self._topological_order(), initial_request, results)
+        return self._finalize_results(results)
+
+    def _run_batch_nodes(
+        self,
+        node_order: List[str],
+        initial_request: Dict[str, Any],
+        results: Dict[str, Any],
+    ) -> None:
+        for node_id in node_order:
+            node = self.nodes[node_id]
+            if not all(dep_id in results for dep_id in node.dependencies):
+                missing = [dep_id for dep_id in node.dependencies if dep_id not in results]
+                BBLogger.log(
+                    f"[Pipeline:batch] Skipping {node_id}; waiting on dependencies: {missing}"
+                )
+                continue
+
+            node_request, iteration_specs = self._build_request_for_node(node, results, initial_request)
+            if node_request is _SKIP_PIPELINE_NODE:
+                self._iterated_nodes.discard(node_id)
+                results[node_id] = {}
+                BBLogger.log(f"[Pipeline:batch] {node_id} skipped by input resolution.")
+                continue
+
+            execution_plans = self._expand_iteration_requests(node, node_request, iteration_specs)
+            if not execution_plans:
+                if not iteration_specs:
+                    self._iterated_nodes.discard(node_id)
+                results[node_id] = [] if iteration_specs else {}
+                BBLogger.log(
+                    f"[Pipeline:batch] {node_id} produced no execution plans. "
+                    f"iteration_specs={len(iteration_specs)}"
+                )
+                continue
+
+            execution_results: List[Any] = []
+            BBLogger.log(
+                f"[Pipeline:batch] Executing {node_id} with {len(execution_plans)} plan(s). "
+                f"iteration_specs={len(iteration_specs)}"
+            )
+            for execution_plan in execution_plans:
+                prepared_request = self._prepare_request_for_execution(
+                    node,
+                    execution_plan.get("request", {}),
+                    input_dir_override=execution_plan.get("input_dir"),
+                )
+                result = self._execute_node(
+                    node,
+                    prepared_request,
+                    input_dir_override=execution_plan.get("input_dir"),
+                )
+                execution_results.append(result)
+                self._route_output_files(node)
+
+            if iteration_specs:
+                results[node_id] = self._aggregate_iteration_results(execution_results)
+                self._iterated_nodes.add(node_id)
+            else:
+                self._iterated_nodes.discard(node_id)
+                results[node_id] = execution_results[-1] if execution_results else {}
+
+    def _finalize_results(self, results: Dict[str, Any]):
+        terminal_nodes = [n.node_id for n in self.nodes.values() if n.terminal]
+        if not terminal_nodes and self.nodes:
+            terminal_nodes = [self._topological_order()[-1]]
+        if len(terminal_nodes) == 1:
+            return results.get(terminal_nodes[0])
+        return {node_id: results.get(node_id) for node_id in terminal_nodes}
+
+    def _is_v2_node(self, node: _V2PipelineNode) -> bool:
+        api_version = getattr(node.data_source_class, "api_version", None)
+        return callable(api_version) and node.data_source_class.api_version() == "v2"
+
+    def _is_streaming_node(self, node: _V2PipelineNode) -> bool:
+        if node.instance is None:
+            node.instance = self._instantiate_node(node)
+        if hasattr(node.instance, "supports_streaming"):
+            try:
+                if bool(node.instance.supports_streaming()):
+                    return True
+            except Exception as exc:
+                BBLogger.log(f"Error detecting streaming support for '{node.node_id}': {exc}")
+        return bool(not self._is_v2_node(node) and not node.dependencies and hasattr(node.instance, "fetch"))
+
+    def _build_request_for_streaming_node(
+        self,
+        node: _V2PipelineNode,
+        initial_request: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        request: Dict[str, Any] = {}
+        if node.inputs:
+            for key, raw_value in node.inputs.items():
+                resolved = self._resolve_input_value(node, raw_value, {})
+                if resolved in (_SKIP_PIPELINE_NODE, _SKIP_PIPELINE_INPUT):
+                    continue
+                if key in ("*", "$default") and isinstance(resolved, dict):
+                    request.update(resolved)
+                elif key in ("*", "$default"):
+                    request["value"] = resolved
+                else:
+                    request[key] = resolved
+        for key, value in initial_request.items():
+            request.setdefault(key, value)
+        return request
+
+    def _dependency_closure(self) -> Dict[str, set[str]]:
+        cache: Dict[str, set[str]] = {}
+
+        def _collect(node_id: str) -> set[str]:
+            if node_id in cache:
+                return cache[node_id]
+            deps = set(self.nodes[node_id].dependencies)
+            for dep_id in list(deps):
+                if dep_id in self.nodes:
+                    deps.update(_collect(dep_id))
+            cache[node_id] = deps
+            return deps
+
+        for node_id in self.nodes:
+            _collect(node_id)
+        return cache
+
+    def _run_event_driven(
+        self,
+        initial_request: Dict[str, Any],
+        results: Dict[str, Any],
+        streaming_nodes: List[_V2PipelineNode],
+        batch_order: List[str],
+    ):
+        import queue
+
+        event_queue: "queue.Queue[tuple[str, str, Any]]" = queue.Queue()
+        dependency_map = self._dependency_closure()
+        streaming_node_ids = {node.node_id for node in streaming_nodes}
+        static_batch_order = [
+            node_id
+            for node_id in batch_order
+            if dependency_map.get(node_id, set()).isdisjoint(streaming_node_ids)
+        ]
+        if static_batch_order:
+            BBLogger.log(f"[Pipeline:event] Running static batch nodes first: {static_batch_order}")
+            self._run_batch_nodes(static_batch_order, initial_request, results)
+
+        self._stream_threads = []
+
+        def _publish_stream_event(node: _V2PipelineNode, item: Any) -> None:
+            self._write_result_envelope(node, item)
+            self._route_output_files(node)
+            summary = list(item.keys()) if isinstance(item, dict) else type(item).__name__
+            BBLogger.log(f"[Pipeline:event] Published stream event from {node.node_id}: {summary}")
+            event_queue.put(("event", node.node_id, item))
+
+        def _stream_worker(node: _V2PipelineNode, stream_request: Dict[str, Any]) -> None:
+            emitted_any = False
+            try:
+                if node.instance is None:
+                    node.instance = self._instantiate_node(node)
+
+                if self._is_v2_node(node) and node.instance.supports_streaming():
+                    for item in node.instance.stream(stream_request):
+                        if not self._started:
+                            break
+                        emitted_any = True
+                        _publish_stream_event(node, item)
+                else:
+                    class _EventCollector:
+                        def notify(self_c, data):
+                            nonlocal emitted_any
+                            if not self._started:
+                                return
+                            emitted_any = True
+                            _publish_stream_event(node, data)
+
+                        def update(self_c, data):
+                            self_c.notify(data)
+
+                    try:
+                        node.instance.subscribe(_EventCollector())
+                    except Exception:
+                        pass
+
+                    params = getattr(node.instance, "params", {})
+                    if isinstance(params, dict):
+                        runtime_config = self._runtime_config(node)
+                        params.update(stream_request)
+                        params["TARGET_DIRECTORY"] = runtime_config["output_dir"]
+                        params["context_dir"] = runtime_config["output_dir"]
+
+                    result = node.instance.fetch()
+                    if result is not None and not emitted_any and self._started:
+                        _publish_stream_event(node, result)
+            except Exception as exc:
+                BBLogger.log(f"Streaming node '{node.node_id}' error: {exc}")
+            finally:
+                event_queue.put(("done", node.node_id, None))
+
+        for node in streaming_nodes:
+            node_request = self._build_request_for_streaming_node(node, initial_request)
+            prepared_request = self._prepare_request_for_execution(node, node_request)
+            BBLogger.log(
+                f"[Pipeline:event] Starting stream worker for {node.node_id} "
+                f"with keys={sorted(prepared_request.keys())}"
+            )
+            thread = threading.Thread(
+                target=_stream_worker,
+                args=(node, prepared_request),
+                name=f"Pipeline-{self.pipeline_name}-{node.node_id}",
+                daemon=True,
+            )
+            self._stream_threads.append(thread)
+            thread.start()
+
+        completed_streams: set[str] = set()
+        while self._started:
+            try:
+                timeout = 0.1 if len(completed_streams) == len(streaming_nodes) else 1.0
+                event_type, source_node_id, payload = event_queue.get(timeout=timeout)
+            except queue.Empty:
+                if len(completed_streams) == len(streaming_nodes):
+                    break
+                continue
+
+            if event_type == "done":
+                completed_streams.add(source_node_id)
+                BBLogger.log(
+                    f"[Pipeline:event] Stream worker finished for {source_node_id}. "
+                    f"completed={sorted(completed_streams)}"
+                )
+                continue
+
+            if event_type != "event":
+                continue
+
+            results[source_node_id] = payload
+            affected_batch_nodes = [
+                node_id
+                for node_id in batch_order
+                if source_node_id in dependency_map.get(node_id, set())
+            ]
+            if affected_batch_nodes:
+                BBLogger.log(
+                    f"[Pipeline:event] {source_node_id} triggered downstream batch nodes: {affected_batch_nodes}"
+                )
+                self._run_batch_nodes(affected_batch_nodes, initial_request, results)
+
+        return self._finalize_results(results)
 
     def _load_connection_records(self) -> Dict[str, Dict[str, Any]]:
         try:
@@ -513,6 +822,11 @@ class _SubjectiveDataSourcePipelineRunner:
         nodes = self.pipeline_config.get("nodes", [])
         if not isinstance(nodes, list):
             raise ValueError("Pipeline config must contain a 'nodes' list")
+        known_node_ids = {
+            str(raw_node.get("node_id") or "").strip()
+            for raw_node in nodes
+            if isinstance(raw_node, dict) and str(raw_node.get("node_id") or "").strip()
+        }
 
         workbench_inputs = {}
         workbench = self.pipeline_config.get("workbench", {}) or {}
@@ -523,6 +837,33 @@ class _SubjectiveDataSourcePipelineRunner:
                 str(conn.get("from_node") or "")
             )
 
+        terminal_source_ids: set[str] = set()
+        # Identify workflow element node IDs so we can skip them and/or
+        # interpret them at runtime.
+        workflow_node_ids = set()
+        for raw_node in nodes:
+            if not isinstance(raw_node, dict):
+                continue
+            cls = str(raw_node.get("class") or "").strip()
+            nid = str(raw_node.get("node_id") or "").strip()
+            if cls.startswith("__") and cls.endswith("__") and nid:
+                workflow_node_ids.add(nid)
+                raw_inputs = raw_node.get("inputs", {}) or {}
+                if not isinstance(raw_inputs, dict):
+                    raw_inputs = {}
+                if cls == "__start__":
+                    self._workflow_start_node_ids.add(nid)
+                elif cls == "__end__":
+                    self._workflow_end_node_ids.add(nid)
+                    terminal_source_ids.update(
+                        self._extract_dependencies(raw_inputs, known_node_ids=known_node_ids)
+                    )
+                elif cls == "__iterator__":
+                    self._workflow_iterator_nodes[nid] = {
+                        "inputs": raw_inputs,
+                        "dependencies": self._extract_dependencies(raw_inputs, known_node_ids=known_node_ids),
+                    }
+
         for raw_node in nodes:
             if not isinstance(raw_node, dict):
                 continue
@@ -531,17 +872,31 @@ class _SubjectiveDataSourcePipelineRunner:
             if not node_id or not class_name:
                 raise ValueError("Each v2 pipeline node must define 'node_id' and 'class'")
 
+            # Workflow elements (e.g. __iterator__, __start__, __end__, __condition__,
+            # __fork__, __function__) are visual constructs handled by the editor;
+            # they have no backing datasource class to import.
+            if class_name.startswith("__") and class_name.endswith("__"):
+                continue
+
             inputs = raw_node.get("inputs", {}) or {}
             if not isinstance(inputs, dict):
                 inputs = {}
-            dependencies = self._extract_dependencies(inputs) or workbench_inputs.get(node_id, [])
+            raw_internal_data = raw_node.get("internal_data")
+            internal_data = raw_internal_data if isinstance(raw_internal_data, dict) else {}
+            dependencies = self._extract_dependencies(inputs, known_node_ids=known_node_ids) or workbench_inputs.get(node_id, [])
+            dependencies = self._expand_workflow_dependencies(dependencies, workflow_node_ids)
 
             node = _V2PipelineNode(
                 node_id=node_id,
                 class_name=class_name,
                 connection_name=str(raw_node.get("connection_name") or node_id),
                 inputs=inputs,
-                terminal=bool(raw_node.get("terminal", False)),
+                selected_action=str(
+                    raw_node.get("selected_action")
+                    or internal_data.get("selected_action")
+                    or ""
+                ).strip(),
+                terminal=bool(raw_node.get("terminal", False) or node_id in terminal_source_ids),
                 dependencies=list(dict.fromkeys(dependencies)),
                 filter_expr=str(raw_node.get("filter") or ""),
                 transform_expr=str(raw_node.get("transform") or ""),
@@ -549,13 +904,51 @@ class _SubjectiveDataSourcePipelineRunner:
             node.data_source_class = import_datasource_class(class_name, project_root=os.getcwd())
             self.nodes[node_id] = node
 
-    def _extract_dependencies(self, inputs: Dict[str, Any]) -> List[str]:
+    def _expand_workflow_dependencies(
+        self,
+        dependencies: List[str],
+        workflow_node_ids: set[str],
+    ) -> List[str]:
+        expanded: List[str] = []
+        for dep_id in dependencies:
+            dep_id = str(dep_id or "").strip()
+            if not dep_id:
+                continue
+            if dep_id in self._workflow_start_node_ids or dep_id in self._workflow_end_node_ids:
+                continue
+            if dep_id in self._workflow_iterator_nodes:
+                for iterator_dep in self._workflow_iterator_nodes[dep_id].get("dependencies", []):
+                    iterator_dep = str(iterator_dep or "").strip()
+                    if iterator_dep and iterator_dep not in expanded:
+                        expanded.append(iterator_dep)
+                continue
+            if dep_id in workflow_node_ids:
+                continue
+            if dep_id not in expanded:
+                expanded.append(dep_id)
+        return expanded
+
+    def _extract_dependencies(self, inputs: Dict[str, Any], known_node_ids: Optional[set[str]] = None) -> List[str]:
         deps = []
-        for value in inputs.values():
+        if not isinstance(inputs, dict):
+            return deps
+        valid_node_ids = set(known_node_ids or set())
+
+        def _collect(value: Any):
+            if isinstance(value, dict) and "from" in value:
+                _collect(value.get("from"))
+                return
+            if isinstance(value, list):
+                for item in value:
+                    _collect(item)
+                return
             if isinstance(value, str) and "." in value and not value.startswith("$"):
                 dep_id = value.split(".", 1)[0].strip()
-                if dep_id and dep_id not in deps:
+                if dep_id and (not valid_node_ids or dep_id in valid_node_ids) and dep_id not in deps:
                     deps.append(dep_id)
+
+        for value in inputs.values():
+            _collect(value)
         return deps
 
     def _topological_order(self) -> List[str]:
@@ -585,13 +978,22 @@ class _SubjectiveDataSourcePipelineRunner:
     def _resolve_connection_data(self, connection_name: str) -> Dict[str, Any]:
         record = self._connection_records.get(connection_name) or {}
         connection_data = record.get("connection_data")
-        if isinstance(connection_data, dict):
-            return dict(connection_data)
         internal_data = record.get("internal_data")
+        discovery_depth = None
+        if isinstance(internal_data, dict):
+            discovery_depth = internal_data.get("discovery_depth")
+        if isinstance(connection_data, dict):
+            resolved = dict(connection_data)
+            if discovery_depth not in (None, "") and "discovery_depth" not in resolved:
+                resolved["discovery_depth"] = discovery_depth
+            return resolved
         if isinstance(internal_data, dict):
             nested = internal_data.get("connection_data")
             if isinstance(nested, dict):
-                return dict(nested)
+                resolved = dict(nested)
+                if discovery_depth not in (None, "") and "discovery_depth" not in resolved:
+                    resolved["discovery_depth"] = discovery_depth
+                return resolved
             return dict(internal_data)
         return {}
 
@@ -600,35 +1002,52 @@ class _SubjectiveDataSourcePipelineRunner:
         connection_data = self._resolve_connection_data(node.connection_name)
         api_version = getattr(node.data_source_class, "api_version", None)
         is_v2 = callable(api_version) and node.data_source_class.api_version() == "v2"
+        BBLogger.log(
+            f"[Pipeline:instantiate] {node.node_id}: detected API={'v2' if is_v2 else 'v1'} "
+            f"for {getattr(node.data_source_class, '__name__', node.class_name)}"
+        )
 
-        if is_v2:
-            return node.data_source_class(connection=connection_data, config=config)
-
-        params = dict(connection_data)
-        params["connection_name"] = node.connection_name
-        params["TARGET_DIRECTORY"] = config["output_dir"]
-        params["target_directory"] = config["output_dir"]
-        params["context_dir"] = config["output_dir"]
-        params["ds_connection_tmp_space"] = self.workspace_root
-        kwargs = {
-            "name": node.node_id,
-            "params": params,
-        }
         try:
-            signature = inspect.signature(node.data_source_class.__init__)
-            accepts_var_kw = any(
-                parameter.kind == parameter.VAR_KEYWORD
-                for parameter in signature.parameters.values()
+            if is_v2:
+                return node.data_source_class(connection=connection_data, config=config)
+
+            params = dict(connection_data)
+            params["connection_name"] = node.connection_name
+            params["TARGET_DIRECTORY"] = config["output_dir"]
+            params["target_directory"] = config["output_dir"]
+            params["context_dir"] = config["output_dir"]
+            params["ds_connection_tmp_space"] = self.workspace_root
+            kwargs = {
+                "name": node.node_id,
+                "params": params,
+            }
+            try:
+                signature = inspect.signature(node.data_source_class.__init__)
+                accepts_var_kw = any(
+                    parameter.kind == parameter.VAR_KEYWORD
+                    for parameter in signature.parameters.values()
+                )
+                if not accepts_var_kw:
+                    kwargs = {
+                        key: value
+                        for key, value in kwargs.items()
+                        if key in signature.parameters
+                    }
+            except Exception:
+                pass
+            return node.data_source_class(**kwargs) if kwargs else node.data_source_class()
+        except TypeError as exc:
+            BBLogger.log(
+                f"[Pipeline:instantiate] {node.node_id}: constructor signature mismatch: {exc}\n"
+                f"{traceback.format_exc()}"
             )
-            if not accepts_var_kw:
-                kwargs = {
-                    key: value
-                    for key, value in kwargs.items()
-                    if key in signature.parameters
-                }
-        except Exception:
-            pass
-        return node.data_source_class(**kwargs) if kwargs else node.data_source_class()
+            raise
+        except Exception as exc:
+            BBLogger.log(
+                f"[Pipeline:instantiate] {node.node_id}: init failed: {exc}\n"
+                f"{traceback.format_exc()}"
+            )
+            raise
 
     def _runtime_config(self, node: _V2PipelineNode) -> Dict[str, str]:
         input_dir, output_dir, scratch_dir = self._ensure_node_dirs(node.node_id)
@@ -646,17 +1065,25 @@ class _SubjectiveDataSourcePipelineRunner:
         node: _V2PipelineNode,
         results: Dict[str, Any],
         initial_request: Dict[str, Any],
-    ) -> Dict[str, Any]:
+    ) -> tuple[Dict[str, Any] | object, List[Dict[str, Any]]]:
+        iteration_specs: List[Dict[str, Any]] = []
         if node.inputs:
             request: Dict[str, Any] = {}
             for key, raw_value in node.inputs.items():
                 resolved = self._resolve_input_value(node, raw_value, results)
+                if resolved is _SKIP_PIPELINE_NODE:
+                    return _SKIP_PIPELINE_NODE, []
+                if resolved is _SKIP_PIPELINE_INPUT:
+                    continue
                 if key in ("*", "$default") and isinstance(resolved, dict):
                     request.update(resolved)
                 elif key in ("*", "$default"):
                     request["value"] = resolved
                 else:
                     request[key] = resolved
+                    iteration_spec = self._build_iteration_spec(key, raw_value, resolved)
+                    if iteration_spec is not None:
+                        iteration_specs.append(iteration_spec)
         elif node.dependencies:
             request = {}
             for dep_id in node.dependencies:
@@ -667,13 +1094,170 @@ class _SubjectiveDataSourcePipelineRunner:
                     request[dep_id] = dep_value
         else:
             request = dict(initial_request)
+        return request, iteration_specs
+
+    def _build_iteration_spec(self, request_key: str, raw_value: Any, resolved: Any) -> Dict[str, Any] | None:
+        if request_key in ("*", "$default"):
+            return None
+        if not isinstance(resolved, list):
+            return None
+
+        source_ref = ""
+        if isinstance(raw_value, dict) and "from" in raw_value:
+            source_ref = str(raw_value.get("from") or "").strip()
+        elif isinstance(raw_value, str):
+            source_ref = str(raw_value).strip()
+
+        if not source_ref or "." not in source_ref or source_ref.startswith("$"):
+            return None
+
+        source_node_id, source_port = source_ref.split(".", 1)
+        source_node_id = source_node_id.strip()
+        source_port = source_port.strip()
+        if source_node_id not in self.nodes and source_node_id not in self._workflow_iterator_nodes:
+            return None
+
+        if "[]" in source_port:
+            array_root = source_port.split("[]", 1)[0].rstrip(".")
+            if not array_root:
+                return None
+
+            return {
+                "request_key": str(request_key),
+                "values": list(resolved),
+                "source_node_id": source_node_id,
+                "source_port": source_port,
+                "array_root": array_root,
+                "safe_array_root": self._sanitize_iteration_root(array_root),
+            }
+
+        if source_node_id in self._iterated_nodes or source_node_id in self._workflow_iterator_nodes:
+            return {
+                "request_key": str(request_key),
+                "values": list(resolved),
+                "source_node_id": source_node_id,
+                "source_port": source_port,
+                "array_root": source_port,
+                "safe_array_root": self._sanitize_iteration_root(source_port),
+            }
+
+        return None
+
+    def _sanitize_iteration_root(self, root_name: str) -> str:
+        return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(root_name or "")).strip("_.-") or "items"
+
+    def _expand_iteration_requests(
+        self,
+        node: _V2PipelineNode,
+        request: Dict[str, Any],
+        iteration_specs: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        base_request = copy.deepcopy(dict(request or {}))
+        if not iteration_specs:
+            return [{"request": base_request, "input_dir": None}]
+
+        iteration_count = max((len(spec.get("values", [])) for spec in iteration_specs), default=0)
+        if iteration_count <= 0:
+            return []
+
+        plans: List[Dict[str, Any]] = []
+        for iteration_index in range(iteration_count):
+            iteration_request = copy.deepcopy(base_request)
+            for spec in iteration_specs:
+                request_key = str(spec.get("request_key") or "").strip()
+                values = spec.get("values", [])
+                if not request_key:
+                    continue
+                if iteration_index >= len(values):
+                    iteration_request.pop(request_key, None)
+                    continue
+                iteration_request[request_key] = copy.deepcopy(values[iteration_index])
+            plans.append(
+                {
+                    "request": iteration_request,
+                    "input_dir": self._prepare_iteration_input_dir(node, iteration_specs, iteration_index),
+                }
+            )
+        return plans
+
+    def _prepare_iteration_input_dir(
+        self,
+        node: _V2PipelineNode,
+        iteration_specs: List[Dict[str, Any]],
+        iteration_index: int,
+    ) -> str:
+        base_input_dir, _, scratch_dir = self._ensure_node_dirs(node.node_id)
+        iteration_root = os.path.join(scratch_dir, "__iter_inputs__")
+        os.makedirs(iteration_root, exist_ok=True)
+        iteration_input_dir = os.path.join(iteration_root, f"{node.node_id}_{iteration_index:04d}")
+        if os.path.isdir(iteration_input_dir):
+            shutil.rmtree(iteration_input_dir)
+        os.makedirs(iteration_input_dir, exist_ok=True)
+
+        if not os.path.isdir(base_input_dir):
+            return iteration_input_dir
+
+        array_specs = {
+            (str(spec.get("source_node_id") or "").strip(), str(spec.get("safe_array_root") or "").strip())
+            for spec in iteration_specs
+            if str(spec.get("source_node_id") or "").strip() and str(spec.get("safe_array_root") or "").strip()
+        }
+
+        for file_name in os.listdir(base_input_dir):
+            source_path = os.path.join(base_input_dir, file_name)
+            if not os.path.isfile(source_path):
+                continue
+
+            matched_any = False
+            matched_index = False
+            for source_node_id, safe_array_root in array_specs:
+                file_iteration_index = self._match_iteration_file_index(file_name, source_node_id, safe_array_root)
+                if file_iteration_index is None:
+                    continue
+                matched_any = True
+                if file_iteration_index == iteration_index:
+                    matched_index = True
+
+            if matched_any and not matched_index:
+                continue
+
+            shutil.copy2(source_path, os.path.join(iteration_input_dir, file_name))
+
+        return iteration_input_dir
+
+    def _match_iteration_file_index(self, file_name: str, source_node_id: str, safe_array_root: str) -> Optional[int]:
+        marker = f"-{source_node_id}."
+        if marker not in file_name:
+            return None
+        original_name = file_name.split(marker, 1)[1]
+        match = re.match(
+            rf"^{re.escape(safe_array_root)}_(\d+)(?:\..*)?$",
+            original_name,
+        )
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except Exception:
+            return None
+
+    def _prepare_request_for_execution(
+        self,
+        node: _V2PipelineNode,
+        request: Dict[str, Any],
+        input_dir_override: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        prepared_request = dict(request or {})
+        selected_action = str(getattr(node, "selected_action", "") or "").strip()
+        if selected_action and selected_action not in {"All Ports", "__all_ports__"}:
+            prepared_request["_action"] = selected_action
 
         if node.filter_expr:
             try:
                 allowed = eval(
                     node.filter_expr,
                     {"__builtins__": {}},
-                    {"data": request, "str": str, "int": int, "float": float},
+                    {"data": prepared_request, "str": str, "int": int, "float": float},
                 )
                 if not allowed:
                     return {}
@@ -685,16 +1269,46 @@ class _SubjectiveDataSourcePipelineRunner:
                 transformed = eval(
                     node.transform_expr,
                     {"__builtins__": {}},
-                    {"data": request, "str": str, "int": int, "float": float},
+                    {"data": prepared_request, "str": str, "int": int, "float": float},
                 )
                 if isinstance(transformed, dict):
-                    request = transformed
+                    prepared_request = transformed
             except Exception as exc:
                 BBLogger.log(f"Pipeline transform error for '{node.node_id}': {exc}")
 
-        return self._stage_request_files(node, request)
+        return self._stage_request_files(node, prepared_request, input_dir_override=input_dir_override)
+
+    def _aggregate_iteration_results(self, results: List[Any]) -> Any:
+        if not results:
+            return []
+        if all(isinstance(result, dict) for result in results):
+            aggregated: Dict[str, List[Any]] = {}
+            ordered_keys: List[str] = []
+            for result in results:
+                for key in result.keys():
+                    if key not in ordered_keys:
+                        ordered_keys.append(key)
+            for key in ordered_keys:
+                aggregated[key] = [result.get(key) if isinstance(result, dict) else None for result in results]
+            return aggregated
+        return list(results)
 
     def _resolve_input_value(self, node: _V2PipelineNode, raw_value: Any, results: Dict[str, Any]):
+        if isinstance(raw_value, dict) and "from" in raw_value:
+            ref_value = raw_value.get("from")
+            expr = str(raw_value.get("expr") or "").strip()
+            source_data = self._source_result_for_reference(ref_value, results)
+            resolved = self._resolve_input_value(node, ref_value, results)
+            if resolved is _SKIP_PIPELINE_NODE or resolved is _SKIP_PIPELINE_INPUT:
+                return resolved
+            if expr:
+                evaluated = self._eval_edge_expr(expr, resolved, source_data)
+                if evaluated is False:
+                    return _SKIP_PIPELINE_NODE
+                if evaluated is None:
+                    return _SKIP_PIPELINE_INPUT
+                return evaluated
+            return resolved
         if not isinstance(raw_value, str):
             return raw_value
         if raw_value.startswith("$env."):
@@ -702,12 +1316,113 @@ class _SubjectiveDataSourcePipelineRunner:
         if "." not in raw_value or raw_value.startswith("$"):
             return raw_value
         source_node_id, field_name = raw_value.split(".", 1)
+        source_node_id = source_node_id.strip()
+        field_name = field_name.strip()
+        if source_node_id in self._workflow_start_node_ids:
+            return _SKIP_PIPELINE_INPUT
+        if source_node_id in self._workflow_iterator_nodes:
+            return self._resolve_iterator_output(source_node_id, field_name, results)
+        if source_node_id not in self.nodes:
+            return raw_value
         source_value = results.get(source_node_id)
         if field_name == "*":
             return self._remap_result_files(node, source_node_id, source_value)
         if isinstance(source_value, dict):
             return self._remap_result_files(node, source_node_id, source_value.get(field_name))
         return None
+
+    def _source_result_for_reference(self, raw_value: Any, results: Dict[str, Any]) -> Any:
+        if not isinstance(raw_value, str):
+            return None
+        if "." not in raw_value or raw_value.startswith("$"):
+            return None
+        source_node_id, field_name = raw_value.split(".", 1)
+        source_node_id = source_node_id.strip()
+        field_name = field_name.strip()
+        if source_node_id in self._workflow_iterator_nodes:
+            return {field_name: self._resolve_iterator_output(source_node_id, field_name, results)}
+        if source_node_id not in self.nodes:
+            return None
+        return results.get(source_node_id)
+
+    def _resolve_iterator_output(self, iterator_node_id: str, field_name: str, results: Dict[str, Any]):
+        iterator_node = self._workflow_iterator_nodes.get(iterator_node_id) or {}
+        raw_inputs = iterator_node.get("inputs", {})
+        if not isinstance(raw_inputs, dict):
+            raw_inputs = {}
+        if field_name not in {"current_item", "*"}:
+            return None
+
+        items: List[Any] = []
+        for port_name in self._sorted_iterator_port_names(raw_inputs):
+            raw_port_value = raw_inputs.get(port_name)
+            for candidate in self._iter_iterator_raw_values(raw_port_value):
+                resolved = self._resolve_iterator_input_reference(candidate, results)
+                if resolved in (_SKIP_PIPELINE_INPUT, _SKIP_PIPELINE_NODE, None):
+                    continue
+                if isinstance(resolved, list):
+                    items.extend(copy.deepcopy(resolved))
+                else:
+                    items.append(copy.deepcopy(resolved))
+        return items
+
+    def _sorted_iterator_port_names(self, raw_inputs: Dict[str, Any]) -> List[str]:
+        def _key(port_name: str) -> tuple[int, int, str]:
+            text = str(port_name or "").strip()
+            if text == "items":
+                return (0, 0, text)
+            match = re.fullmatch(r"items_(\d+)", text)
+            if match:
+                return (0, int(match.group(1)), text)
+            return (1, 0, text)
+
+        return sorted((str(name or "").strip() for name in raw_inputs.keys()), key=_key)
+
+    def _iter_iterator_raw_values(self, raw_value: Any) -> List[Any]:
+        if isinstance(raw_value, list):
+            return list(raw_value)
+        return [raw_value]
+
+    def _resolve_iterator_input_reference(self, raw_value: Any, results: Dict[str, Any]):
+        if isinstance(raw_value, dict) and "from" in raw_value:
+            raw_value = raw_value.get("from")
+        if not isinstance(raw_value, str):
+            return raw_value
+        if "." not in raw_value or raw_value.startswith("$"):
+            return raw_value
+        source_node_id, field_name = raw_value.split(".", 1)
+        source_node_id = source_node_id.strip()
+        field_name = field_name.strip()
+        source_value = results.get(source_node_id)
+        if isinstance(source_value, dict):
+            return source_value.get(field_name)
+        if field_name == "*":
+            return source_value
+        return None
+
+    def _eval_edge_expr(self, expr: str, value: Any, source_data: Any) -> Any:
+        import os.path as _os_path
+
+        class _SafeOS:
+            path = _os_path
+
+        local_data = source_data if isinstance(source_data, dict) else {"value": value}
+        try:
+            return eval(
+                expr,
+                {"__builtins__": {}},
+                {
+                    "value": value,
+                    "data": local_data,
+                    "str": str,
+                    "int": int,
+                    "float": float,
+                    "os": _SafeOS,
+                },
+            )
+        except Exception as exc:
+            BBLogger.log(f"Error evaluating edge expression '{expr}': {exc}")
+            return value
 
     def _remap_result_files(self, node: _V2PipelineNode, source_node_id: str, value: Any):
         if isinstance(value, dict):
@@ -721,13 +1436,19 @@ class _SubjectiveDataSourcePipelineRunner:
             return self._resolve_routed_input_file(node, source_node_id, value)
         return value
 
-    def _resolve_routed_input_file(self, node: _V2PipelineNode, source_node_id: str, value: str) -> str:
+    def _resolve_routed_input_file(
+        self,
+        node: _V2PipelineNode,
+        source_node_id: str,
+        value: str,
+        input_dir_override: Optional[str] = None,
+    ) -> str:
         if not value:
             return value
         if os.path.isfile(value):
             return value
 
-        input_dir, _, _ = self._ensure_node_dirs(node.node_id)
+        input_dir = input_dir_override or self._ensure_node_dirs(node.node_id)[0]
         basename = os.path.basename(value)
         if not basename or not os.path.isdir(input_dir):
             return value
@@ -747,8 +1468,13 @@ class _SubjectiveDataSourcePipelineRunner:
             return value
         return sorted(candidates)[-1]
 
-    def _stage_request_files(self, node: _V2PipelineNode, request: Dict[str, Any]) -> Dict[str, Any]:
-        input_dir, _, _ = self._ensure_node_dirs(node.node_id)
+    def _stage_request_files(
+        self,
+        node: _V2PipelineNode,
+        request: Dict[str, Any],
+        input_dir_override: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        input_dir = input_dir_override or self._ensure_node_dirs(node.node_id)[0]
 
         def _convert(value):
             if isinstance(value, dict):
@@ -764,55 +1490,108 @@ class _SubjectiveDataSourcePipelineRunner:
             if isinstance(value, str):
                 basename = os.path.basename(value)
                 if basename:
-                    remapped = self._resolve_routed_input_file(node, "", value)
+                    remapped = self._resolve_routed_input_file(
+                        node,
+                        "",
+                        value,
+                        input_dir_override=input_dir,
+                    )
                     if remapped != value:
                         return remapped
             return value
 
         return _convert(request)
 
-    def _execute_node(self, node: _V2PipelineNode, request: Dict[str, Any]):
+    def _execute_node(
+        self,
+        node: _V2PipelineNode,
+        request: Dict[str, Any],
+        input_dir_override: Optional[str] = None,
+    ):
         if node.instance is None:
             node.instance = self._instantiate_node(node)
 
         api_version = getattr(node.data_source_class, "api_version", None)
         is_v2 = callable(api_version) and node.data_source_class.api_version() == "v2"
 
-        if is_v2:
-            if node.instance.supports_streaming():
-                results = list(node.instance.stream(request))
-                result = results[-1] if results else None
+        original_input_dir = None
+        config = getattr(node.instance, "_config", None)
+        if input_dir_override:
+            if not isinstance(config, dict):
+                config = {}
+                setattr(node.instance, "_config", config)
+            original_input_dir = config.get("input_dir")
+            config["input_dir"] = input_dir_override
+
+        try:
+            BBLogger.log(
+                f"[Pipeline:execute] Running {node.node_id} "
+                f"(api={'v2' if is_v2 else 'v1'}) with keys={sorted((request or {}).keys())} "
+                f"input_dir_override={input_dir_override or ''}"
+            )
+            if is_v2:
+                if node.instance.supports_streaming():
+                    stream_results: List[Any] = []
+                    for item in node.instance.stream(request):
+                        stream_results.append(item)
+                        self._write_result_envelope(node, item)
+                        self._route_output_files(node)
+                    if len(stream_results) > 1:
+                        result = self._aggregate_iteration_results(stream_results)
+                    else:
+                        result = stream_results[0] if stream_results else None
+                else:
+                    result = node.instance.run(request)
             else:
-                result = node.instance.run(request)
-        else:
-            collector: List[Any] = []
+                collector: List[Any] = []
 
-            class _Collector:
-                def notify(self, data):
-                    collector.append(data)
+                class _Collector:
+                    def notify(self, data):
+                        collector.append(data)
 
-                def update(self, data):
-                    collector.append(data)
+                    def update(self, data):
+                        collector.append(data)
 
-            try:
-                node.instance.subscribe(_Collector())
-            except Exception:
-                pass
+                try:
+                    node.instance.subscribe(_Collector())
+                except Exception:
+                    pass
 
-            params = getattr(node.instance, "params", {})
-            if isinstance(params, dict):
-                params.update(request)
-                params["TARGET_DIRECTORY"] = self._runtime_config(node)["output_dir"]
-                params["context_dir"] = self._runtime_config(node)["output_dir"]
+                params = getattr(node.instance, "params", {})
+                if isinstance(params, dict):
+                    params.update(request)
+                    params["TARGET_DIRECTORY"] = self._runtime_config(node)["output_dir"]
+                    params["context_dir"] = self._runtime_config(node)["output_dir"]
+                    if input_dir_override:
+                        params["input_dir"] = input_dir_override
 
-            if request and hasattr(node.instance, "process_input"):
-                result = node.instance.process_input(request)
-                if result is None and collector:
-                    result = collector[-1]
+                if request and hasattr(node.instance, "process_input"):
+                    result = node.instance.process_input(request)
+                    if result is None and collector:
+                        result = collector[-1]
+                else:
+                    result = node.instance.fetch()
+                    if result is None and collector:
+                        result = collector[-1]
+            if isinstance(result, dict):
+                BBLogger.log(
+                    f"[Pipeline:execute] {node.node_id} completed with result keys={sorted(result.keys())}"
+                )
             else:
-                result = node.instance.fetch()
-                if result is None and collector:
-                    result = collector[-1]
+                BBLogger.log(
+                    f"[Pipeline:execute] {node.node_id} completed with result type={type(result).__name__}"
+                )
+        except Exception as exc:
+            BBLogger.log(
+                f"[Pipeline:execute] {node.node_id} failed: {exc}\n{traceback.format_exc()}"
+            )
+            raise
+        finally:
+            if input_dir_override and isinstance(getattr(node.instance, "_config", None), dict):
+                if original_input_dir in (None, ""):
+                    node.instance._config.pop("input_dir", None)
+                else:
+                    node.instance._config["input_dir"] = original_input_dir
 
         if result is not None:
             self._write_result_envelope(node, result)
@@ -846,9 +1625,12 @@ class _SubjectiveDataSourcePipelineRunner:
         downstream_nodes = self._get_downstream_nodes(node.node_id)
         if node.terminal or not downstream_nodes:
             os.makedirs(self.context_dir, exist_ok=True)
+            ds_type = node.data_source_class.__name__.replace("Subjective", "").replace("DataSource", "")
+            stamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
             for file_name in files:
                 source_path = os.path.join(output_dir, file_name)
-                destination = self._unique_destination(self.context_dir, f"{node.node_id}-{file_name}")
+                context_name = f"{stamp}-{ds_type}-{node.node_id}-context.json"
+                destination = self._unique_destination(self.context_dir, context_name)
                 shutil.move(source_path, destination)
             return
 
@@ -930,15 +1712,35 @@ class SubjectivePipelineDataSource(SubjectiveDataSource):
     def run(self, request: dict) -> Any:
         self._load_pipeline_config()
         if str(self.pipeline_config.get("version") or "").strip() == "2":
-            runner = _SubjectiveDataSourcePipelineRunner(
-                pipeline_name=self.pipeline_config.get("name", self.pipeline_name),
-                pipeline_config=self.pipeline_config,
-                context_dir=self.output_dir or self._resolve_context_path(),
-                tmp_root=self.get_connection_temp_dir(),
-            )
-            self.pipeline = runner.build()
-            result = self.pipeline.start(request or {})
-            return {"pipeline_result": result}
+            try:
+                BBLogger.log(f"[Pipeline] Creating V2 runner for pipeline '{self.pipeline_name}'")
+                runner = _SubjectiveDataSourcePipelineRunner(
+                    pipeline_name=self.pipeline_config.get("name", self.pipeline_name),
+                    pipeline_config=self.pipeline_config,
+                    context_dir=self.output_dir or self._resolve_context_path(),
+                    tmp_root=self.get_connection_temp_dir(),
+                )
+                runner._crash_log(f"Runner created. nodes={len(runner.nodes)}")
+                BBLogger.log(
+                    f"[Pipeline] Runner created. nodes={len(runner.nodes)}, "
+                    f"start={len(runner._workflow_start_node_ids)}, "
+                    f"end={len(runner._workflow_end_node_ids)}, "
+                    f"iterator={len(runner._workflow_iterator_nodes)}"
+                )
+                self.pipeline = runner.build()
+                runner._crash_log("build() complete. Starting execution...")
+                BBLogger.log("[Pipeline] build() complete. Starting execution...")
+                result = self.pipeline.start(request or {})
+                runner._crash_log("Execution finished.")
+                BBLogger.log("[Pipeline] Execution finished.")
+                return {"pipeline_result": result}
+            except Exception as exc:
+                msg = f"[Pipeline] FATAL: Pipeline execution failed: {exc}\n{traceback.format_exc()}"
+                print(msg, file=_sys.stderr, flush=True)
+                BBLogger.log(
+                    f"[Pipeline] FATAL: Pipeline execution failed: {exc}\n{traceback.format_exc()}"
+                )
+                raise
 
         self._build_legacy_pipeline_from_config()
         self.pipeline.start()
@@ -965,6 +1767,15 @@ class SubjectivePipelineDataSource(SubjectiveDataSource):
 
     def _load_pipeline_config(self):
         settings = self._get_pipeline_settings()
+        pipeline_path = settings.get("pipeline_json_path") or settings.get("pipeline_file")
+        if pipeline_path:
+            if not os.path.isfile(pipeline_path):
+                raise FileNotFoundError(f"Pipeline file not found: {pipeline_path}")
+            with open(pipeline_path, "r", encoding="utf-8") as fh:
+                self.pipeline_config = json.load(fh)
+            self.pipeline_name = self.pipeline_config.get("name", self.pipeline_name)
+            return
+
         pipeline_json = settings.get("pipeline_json") or settings.get("pipeline_data")
         if pipeline_json:
             if isinstance(pipeline_json, str):
@@ -973,13 +1784,6 @@ class SubjectivePipelineDataSource(SubjectiveDataSource):
                 self.pipeline_config = pipeline_json
             else:
                 raise ValueError("pipeline_json must be a string or dict")
-            self.pipeline_name = self.pipeline_config.get("name", self.pipeline_name)
-            return
-
-        pipeline_path = settings.get("pipeline_json_path") or settings.get("pipeline_file")
-        if pipeline_path:
-            with open(pipeline_path, "r", encoding="utf-8") as fh:
-                self.pipeline_config = json.load(fh)
             self.pipeline_name = self.pipeline_config.get("name", self.pipeline_name)
             return
 
