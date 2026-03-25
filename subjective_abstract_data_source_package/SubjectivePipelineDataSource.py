@@ -64,7 +64,12 @@ def _inline_ticker_stream_payload(
     start_time: float,
     immediate: bool = False,
 ) -> Dict[str, Any]:
-    """Single stream event dict for __ticker__ workflow nodes (matches workbench output ports)."""
+    """Single stream event dict for __ticker__ workflow nodes.
+
+    The workbench now exposes a single ``output`` port. Legacy top-level aliases are
+    still included so older saved pipelines that referenced ``tick_number`` and
+    related fields continue to resolve.
+    """
     tick_data = {
         "tick": True,
         "timestamp": time.time(),
@@ -83,7 +88,8 @@ def _inline_ticker_stream_payload(
         tick_data["interval_unit"] = str(ticker_config.get("interval_unit") or "sec")
     if immediate:
         tick_data["immediate"] = True
-    out = dict(tick_data)
+    out = {"output": dict(tick_data)}
+    out.update(tick_data)
     out["whole output"] = dict(tick_data)
     return out
 
