@@ -16,9 +16,11 @@ import json
 import os
 import re
 import shutil
+import sys as _sys
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 from typing import Any, Callable, Dict, List, Optional
 
@@ -26,6 +28,147 @@ from brainboost_data_source_logger_package.BBLogger import BBLogger
 
 from subjective_abstract_data_source_package import SubjectiveDataSource
 from subjective_abstract_data_source_package.datasource_importer import import_datasource_class
+from subjective_abstract_data_source_package.pipeline_ticker_config import (
+    normalize_pipeline_ticker_config,
+    validate_pipeline_ticker_config,
+)
+from subjective_abstract_data_source_package.pipeline_accumulator_config import (
+    normalize_pipeline_accumulator_config,
+)
+
+
+PIPELINE_TICKER_UNIT_TO_SECONDS = {
+    "ms": 0.001,
+    "sec": 1.0,
+    "min": 60.0,
+    "hour": 3600.0,
+}
+
+
+def _inline_ticker_wait_seconds(ticker_config: Dict[str, Any], cron_iter=None) -> float:
+    if str(ticker_config.get("mode") or "") == "cron":
+        if cron_iter is None:
+            return 60.0
+        next_time = cron_iter.get_next(datetime)
+        return max(0.1, (next_time - datetime.now()).total_seconds())
+    unit = str(ticker_config.get("interval_unit") or "sec").strip().lower()
+    value = int(ticker_config.get("interval_value") or 0)
+    multiplier = PIPELINE_TICKER_UNIT_TO_SECONDS.get(unit, 1.0)
+    return max(0.001, float(value) * float(multiplier))
+
+
+def _inline_ticker_stream_payload(
+    pipeline_name: str,
+    ticker_config: Dict[str, Any],
+    tick_number: int,
+    start_time: float,
+    immediate: bool = False,
+) -> Dict[str, Any]:
+    """Single stream event dict for __ticker__ workflow nodes (matches workbench output ports)."""
+    tick_data = {
+        "tick": True,
+        "timestamp": time.time(),
+        "timestamp_iso": datetime.now().isoformat(),
+        "datasource_id": pipeline_name,
+        "datasource_type": "SubjectivePipelineDataSource",
+        "mode": str(ticker_config.get("mode") or "interval"),
+        "tick_number": int(tick_number),
+        "elapsed_time": max(0.0, time.time() - float(start_time)),
+        "subscriber": "",
+    }
+    if str(ticker_config.get("mode") or "") == "cron":
+        tick_data["cron_expression"] = str(ticker_config.get("cron_expression") or "")
+    else:
+        tick_data["interval_value"] = int(ticker_config.get("interval_value") or 0)
+        tick_data["interval_unit"] = str(ticker_config.get("interval_unit") or "sec")
+    if immediate:
+        tick_data["immediate"] = True
+    out = dict(tick_data)
+    out["whole output"] = dict(tick_data)
+    return out
+
+
+class InlineTickerWorkflowSource:
+    """Inline v2 streaming source for workflow element __ticker__ (no external plugin)."""
+
+    @classmethod
+    def api_version(cls):
+        return "v2"
+
+    def __init__(self, connection=None, config=None):
+        self._connection = connection or {}
+        self._cfg = dict(config or {})
+        merged = dict(self._cfg.get("internal_data") or {})
+        merged["enabled"] = True
+        self._ticker = normalize_pipeline_ticker_config(merged)
+        self._stop_event = self._cfg.get("pipeline_stop_event")
+        self._started_check = self._cfg.get("pipeline_started_check") or (lambda: True)
+        self._pipeline_name = str(self._cfg.get("pipeline_name") or "pipeline")
+
+    def supports_streaming(self):
+        return True
+
+    def stream(self, request):
+        errs = validate_pipeline_ticker_config(self._ticker)
+        if errs:
+            raise ValueError("; ".join(errs))
+
+        cron_iter = None
+        if str(self._ticker.get("mode") or "") == "cron":
+            from croniter import croniter
+
+            cron_iter = croniter(str(self._ticker.get("cron_expression") or ""), datetime.now())
+
+        start_time = time.time()
+        tick_number = 0
+
+        def _wait(seconds: float) -> bool:
+            if self._stop_event is None:
+                time.sleep(seconds)
+                return False
+            return bool(self._stop_event.wait(timeout=seconds))
+
+        if self._ticker.get("immediate_first_tick"):
+            tick_number += 1
+            payload = _inline_ticker_stream_payload(
+                self._pipeline_name,
+                self._ticker,
+                tick_number=tick_number,
+                start_time=start_time,
+                immediate=True,
+            )
+            BBLogger.log(
+                f"[Pipeline:ticker] Tick #{tick_number} (immediate) from inline __ticker__ node"
+            )
+            yield payload
+
+        while self._started_check() and (
+            self._stop_event is None or not self._stop_event.is_set()
+        ):
+            if str(self._ticker.get("mode") or "") == "cron":
+                from croniter import croniter
+
+                cron_iter = croniter(
+                    str(self._ticker.get("cron_expression") or ""),
+                    datetime.now(),
+                )
+            wait_seconds = _inline_ticker_wait_seconds(self._ticker, cron_iter=cron_iter)
+            if _wait(wait_seconds):
+                break
+            if not self._started_check():
+                break
+            tick_number += 1
+            payload = _inline_ticker_stream_payload(
+                self._pipeline_name,
+                self._ticker,
+                tick_number=tick_number,
+                start_time=start_time,
+                immediate=False,
+            )
+            BBLogger.log(
+                f"[Pipeline:ticker] Tick #{tick_number} from inline __ticker__ node"
+            )
+            yield payload
 
 
 @dataclass
@@ -424,6 +567,7 @@ class _V2PipelineNode:
     dependencies: List[str] = field(default_factory=list)
     filter_expr: str = ""
     transform_expr: str = ""
+    internal_data: Dict[str, Any] = field(default_factory=dict)
     data_source_class: Any = None
     instance: Any = None
 
@@ -456,7 +600,12 @@ class _SubjectiveDataSourcePipelineRunner:
         self._workflow_start_node_ids: set[str] = set()
         self._workflow_end_node_ids: set[str] = set()
         self._workflow_iterator_nodes: Dict[str, Dict[str, Any]] = {}
+        self._workflow_accumulator_nodes: Dict[str, Dict[str, Any]] = {}
+        self._accumulator_buffers: Dict[str, List[Any]] = {}
+        self._accumulator_last_markers: Dict[str, Dict[str, Any]] = {}
+        self._node_result_versions: Dict[str, int] = {}
         self._stream_threads: List[threading.Thread] = []
+        self._stop_event = threading.Event()
         self._build_nodes()
 
     def _crash_log(self, msg):
@@ -496,6 +645,7 @@ class _SubjectiveDataSourcePipelineRunner:
                     BBLogger.log(f"[Pipeline:build] {msg}")
                     raise
         self._started = True
+        self._stop_event.clear()
         self._crash_log(f"All {len(self.nodes)} nodes instantiated. Build complete.")
         BBLogger.log(f"[Pipeline:build] All {len(self.nodes)} nodes instantiated. Build complete.")
         return self
@@ -536,6 +686,7 @@ class _SubjectiveDataSourcePipelineRunner:
 
     def stop(self):
         self._started = False
+        self._stop_event.set()
         for node in self.nodes.values():
             if node.instance and hasattr(node.instance, "stop"):
                 try:
@@ -553,6 +704,7 @@ class _SubjectiveDataSourcePipelineRunner:
         results: Dict[str, Any],
         node_order: Optional[List[str]] = None,
     ):
+        self._iterated_nodes.clear()
         self._run_batch_nodes(node_order or self._topological_order(), initial_request, results)
         return self._finalize_results(results)
 
@@ -561,7 +713,10 @@ class _SubjectiveDataSourcePipelineRunner:
         node_order: List[str],
         initial_request: Dict[str, Any],
         results: Dict[str, Any],
+        reset_workflow_cycle: bool = True,
     ) -> None:
+        if reset_workflow_cycle:
+            self._clear_accumulator_cycle_outputs(results)
         for node_id in node_order:
             node = self.nodes[node_id]
             if not all(dep_id in results for dep_id in node.dependencies):
@@ -614,6 +769,8 @@ class _SubjectiveDataSourcePipelineRunner:
             else:
                 self._iterated_nodes.discard(node_id)
                 results[node_id] = execution_results[-1] if execution_results else {}
+            self._bump_result_version(node_id)
+            self._refresh_workflow_accumulators(results, changed_node_id=node_id)
 
     def _finalize_results(self, results: Dict[str, Any]):
         terminal_nodes = [n.node_id for n in self.nodes.values() if n.terminal]
@@ -628,6 +785,8 @@ class _SubjectiveDataSourcePipelineRunner:
         return callable(api_version) and node.data_source_class.api_version() == "v2"
 
     def _is_streaming_node(self, node: _V2PipelineNode) -> bool:
+        if str(node.class_name or "").strip() == "__ticker__":
+            return True
         if node.instance is None:
             node.instance = self._instantiate_node(node)
         if hasattr(node.instance, "supports_streaming"):
@@ -675,6 +834,158 @@ class _SubjectiveDataSourcePipelineRunner:
         for node_id in self.nodes:
             _collect(node_id)
         return cache
+
+    def _bump_result_version(self, node_id: str) -> int:
+        node_id = str(node_id or "").strip()
+        if not node_id:
+            return 0
+        version = int(self._node_result_versions.get(node_id, 0) or 0) + 1
+        self._node_result_versions[node_id] = version
+        return version
+
+    def _clear_accumulator_cycle_outputs(self, results: Dict[str, Any]) -> None:
+        for accumulator_node_id in self._workflow_accumulator_nodes:
+            results.pop(accumulator_node_id, None)
+
+    def _iter_accumulator_raw_values(self, raw_inputs: Dict[str, Any]) -> List[tuple[str, int, Any]]:
+        values: List[tuple[str, int, Any]] = []
+        for port_name, raw_value in (raw_inputs or {}).items():
+            if isinstance(raw_value, list):
+                for index, candidate in enumerate(raw_value):
+                    values.append((str(port_name or ""), index, candidate))
+            else:
+                values.append((str(port_name or ""), 0, raw_value))
+        return values
+
+    def _accumulator_reference_marker(self, raw_value: Any, results: Dict[str, Any]) -> Any:
+        if isinstance(raw_value, dict) and "from" in raw_value:
+            raw_value = raw_value.get("from")
+        if not isinstance(raw_value, str):
+            return None
+        source_ref = str(raw_value or "").strip()
+        if "." not in source_ref or source_ref.startswith("$"):
+            return None
+
+        source_node_id, field_name = source_ref.split(".", 1)
+        source_node_id = source_node_id.strip()
+        field_name = field_name.strip()
+
+        if source_node_id in self.nodes:
+            version = int(self._node_result_versions.get(source_node_id, 0) or 0)
+            return (source_node_id, version, field_name) if version > 0 else None
+        if source_node_id in self._workflow_accumulator_nodes:
+            version = int(self._node_result_versions.get(source_node_id, 0) or 0)
+            return (source_node_id, version, field_name) if version > 0 and source_node_id in results else None
+        if source_node_id in self._workflow_iterator_nodes:
+            versions = tuple(
+                (dep_id, int(self._node_result_versions.get(dep_id, 0) or 0))
+                for dep_id in self._workflow_iterator_nodes[source_node_id].get("dependencies", [])
+            )
+            if not any(version > 0 for _, version in versions):
+                return None
+            return (source_node_id, versions, field_name)
+        return None
+
+    def _resolve_accumulator_buffer_value(self, raw_value: Any, results: Dict[str, Any]) -> Any:
+        if isinstance(raw_value, dict) and "from" in raw_value:
+            raw_value = raw_value.get("from")
+        if not isinstance(raw_value, str):
+            return None
+        source_ref = str(raw_value or "").strip()
+        if "." not in source_ref or source_ref.startswith("$"):
+            return None
+
+        source_node_id, field_name = source_ref.split(".", 1)
+        source_node_id = source_node_id.strip()
+        field_name = field_name.strip()
+
+        if source_node_id in self._workflow_iterator_nodes:
+            return self._resolve_iterator_output(source_node_id, field_name, results)
+        if source_node_id in self._workflow_accumulator_nodes:
+            return self._resolve_accumulator_output(
+                source_node_id,
+                field_name,
+                results,
+                skip_if_unready=False,
+            )
+        if source_node_id not in self.nodes:
+            return None
+
+        source_value = results.get(source_node_id)
+        if source_value is None:
+            return None
+        if field_name == "*":
+            return copy.deepcopy(source_value)
+        if isinstance(source_value, dict):
+            return copy.deepcopy(source_value.get(field_name))
+        return None
+
+    def _stringify_accumulator_item(self, value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except Exception:
+            return str(value)
+
+    def _maybe_release_accumulator(self, accumulator_node_id: str) -> Any:
+        accumulator_node = self._workflow_accumulator_nodes.get(accumulator_node_id) or {}
+        config = accumulator_node.get("config", {}) or {}
+        buffer = self._accumulator_buffers.setdefault(accumulator_node_id, [])
+        threshold = max(1, int(config.get("threshold") or 5))
+        if len(buffer) < threshold:
+            return None
+
+        items = list(buffer)
+        if str(accumulator_node.get("class_name") or "").strip() == "__accumulator_stack__":
+            items.reverse()
+
+        buffer.clear()
+        release_mode = str(config.get("release_mode") or "array").strip().lower()
+        if release_mode == "concatenated":
+            separator = str(config.get("separator") if config.get("separator") is not None else "\n")
+            return separator.join(self._stringify_accumulator_item(item) for item in items)
+        return copy.deepcopy(items)
+
+    def _refresh_workflow_accumulators(
+        self,
+        results: Dict[str, Any],
+        changed_node_id: Optional[str] = None,
+    ) -> None:
+        for accumulator_node_id, accumulator_node in self._workflow_accumulator_nodes.items():
+            dependencies = accumulator_node.get("dependencies", []) or []
+            if changed_node_id and dependencies and changed_node_id not in dependencies:
+                continue
+
+            raw_inputs = accumulator_node.get("inputs", {}) or {}
+            markers = self._accumulator_last_markers.setdefault(accumulator_node_id, {})
+            pending_items: List[Any] = []
+            for port_name, index, raw_value in self._iter_accumulator_raw_values(raw_inputs):
+                ref_key = f"{port_name}:{index}"
+                marker = self._accumulator_reference_marker(raw_value, results)
+                if marker is None or markers.get(ref_key) == marker:
+                    continue
+                resolved = self._resolve_accumulator_buffer_value(raw_value, results)
+                if resolved in (None, _SKIP_PIPELINE_INPUT, _SKIP_PIPELINE_NODE):
+                    continue
+                markers[ref_key] = marker
+                pending_items.append(copy.deepcopy(resolved))
+
+            if pending_items:
+                self._accumulator_buffers.setdefault(accumulator_node_id, []).extend(pending_items)
+
+            released_value = self._maybe_release_accumulator(accumulator_node_id)
+            if released_value is None:
+                continue
+
+            results[accumulator_node_id] = {"output": released_value}
+            self._bump_result_version(accumulator_node_id)
+            BBLogger.log(
+                f"[Pipeline:accumulator] Released {accumulator_node_id} "
+                f"count={len(pending_items)} threshold="
+                f"{accumulator_node.get('config', {}).get('threshold', 5)} "
+                f"mode={accumulator_node.get('config', {}).get('release_mode', 'array')}"
+            )
 
     def _run_event_driven(
         self,
@@ -782,12 +1093,31 @@ class _SubjectiveDataSourcePipelineRunner:
                     f"[Pipeline:event] Stream worker finished for {source_node_id}. "
                     f"completed={sorted(completed_streams)}"
                 )
+                non_ticker_streaming_ids = {
+                    n.node_id
+                    for n in streaming_nodes
+                    if str(n.class_name or "").strip() != "__ticker__"
+                }
+                ticker_streaming_ids = {
+                    n.node_id
+                    for n in streaming_nodes
+                    if str(n.class_name or "").strip() == "__ticker__"
+                }
+                if (
+                    ticker_streaming_ids
+                    and non_ticker_streaming_ids
+                    and non_ticker_streaming_ids.issubset(completed_streams)
+                ):
+                    self._stop_event.set()
                 continue
 
             if event_type != "event":
                 continue
 
+            self._clear_accumulator_cycle_outputs(results)
             results[source_node_id] = payload
+            self._bump_result_version(source_node_id)
+            self._refresh_workflow_accumulators(results, changed_node_id=source_node_id)
             affected_batch_nodes = [
                 node_id
                 for node_id in batch_order
@@ -797,7 +1127,12 @@ class _SubjectiveDataSourcePipelineRunner:
                 BBLogger.log(
                     f"[Pipeline:event] {source_node_id} triggered downstream batch nodes: {affected_batch_nodes}"
                 )
-                self._run_batch_nodes(affected_batch_nodes, initial_request, results)
+                self._run_batch_nodes(
+                    affected_batch_nodes,
+                    initial_request,
+                    results,
+                    reset_workflow_cycle=False,
+                )
 
         return self._finalize_results(results)
 
@@ -847,7 +1182,8 @@ class _SubjectiveDataSourcePipelineRunner:
             cls = str(raw_node.get("class") or "").strip()
             nid = str(raw_node.get("node_id") or "").strip()
             if cls.startswith("__") and cls.endswith("__") and nid:
-                workflow_node_ids.add(nid)
+                if cls != "__ticker__":
+                    workflow_node_ids.add(nid)
                 raw_inputs = raw_node.get("inputs", {}) or {}
                 if not isinstance(raw_inputs, dict):
                     raw_inputs = {}
@@ -863,6 +1199,26 @@ class _SubjectiveDataSourcePipelineRunner:
                         "inputs": raw_inputs,
                         "dependencies": self._extract_dependencies(raw_inputs, known_node_ids=known_node_ids),
                     }
+                elif cls in {"__accumulator_stack__", "__accumulator_queue__"}:
+                    self._workflow_accumulator_nodes[nid] = {
+                        "class_name": cls,
+                        "inputs": raw_inputs,
+                        "dependencies": self._extract_dependencies(raw_inputs, known_node_ids=known_node_ids),
+                        "config": normalize_pipeline_accumulator_config(
+                            raw_node.get("internal_data") if isinstance(raw_node.get("internal_data"), dict) else {}
+                        ),
+                    }
+
+        for workflow_node in self._workflow_iterator_nodes.values():
+            workflow_node["dependencies"] = self._expand_workflow_dependencies(
+                workflow_node.get("dependencies", []),
+                workflow_node_ids,
+            )
+        for workflow_node in self._workflow_accumulator_nodes.values():
+            workflow_node["dependencies"] = self._expand_workflow_dependencies(
+                workflow_node.get("dependencies", []),
+                workflow_node_ids,
+            )
 
         for raw_node in nodes:
             if not isinstance(raw_node, dict):
@@ -874,9 +1230,11 @@ class _SubjectiveDataSourcePipelineRunner:
 
             # Workflow elements (e.g. __iterator__, __start__, __end__, __condition__,
             # __fork__, __function__) are visual constructs handled by the editor;
-            # they have no backing datasource class to import.
+            # they have no backing datasource class to import. __ticker__ is special:
+            # it runs as InlineTickerWorkflowSource and participates in event-driven mode.
             if class_name.startswith("__") and class_name.endswith("__"):
-                continue
+                if class_name != "__ticker__":
+                    continue
 
             inputs = raw_node.get("inputs", {}) or {}
             if not isinstance(inputs, dict):
@@ -900,27 +1258,47 @@ class _SubjectiveDataSourcePipelineRunner:
                 dependencies=list(dict.fromkeys(dependencies)),
                 filter_expr=str(raw_node.get("filter") or ""),
                 transform_expr=str(raw_node.get("transform") or ""),
+                internal_data=dict(internal_data),
             )
-            node.data_source_class = import_datasource_class(class_name, project_root=os.getcwd())
+            if class_name == "__ticker__":
+                node.data_source_class = InlineTickerWorkflowSource
+            else:
+                node.data_source_class = import_datasource_class(class_name, project_root=os.getcwd())
             self.nodes[node_id] = node
 
     def _expand_workflow_dependencies(
         self,
         dependencies: List[str],
         workflow_node_ids: set[str],
+        seen: Optional[set[str]] = None,
     ) -> List[str]:
+        seen = set(seen or set())
         expanded: List[str] = []
         for dep_id in dependencies:
             dep_id = str(dep_id or "").strip()
-            if not dep_id:
+            if not dep_id or dep_id in seen:
                 continue
             if dep_id in self._workflow_start_node_ids or dep_id in self._workflow_end_node_ids:
                 continue
             if dep_id in self._workflow_iterator_nodes:
-                for iterator_dep in self._workflow_iterator_nodes[dep_id].get("dependencies", []):
-                    iterator_dep = str(iterator_dep or "").strip()
-                    if iterator_dep and iterator_dep not in expanded:
+                iterator_deps = self._expand_workflow_dependencies(
+                    self._workflow_iterator_nodes[dep_id].get("dependencies", []),
+                    workflow_node_ids,
+                    seen | {dep_id},
+                )
+                for iterator_dep in iterator_deps:
+                    if iterator_dep not in expanded:
                         expanded.append(iterator_dep)
+                continue
+            if dep_id in self._workflow_accumulator_nodes:
+                accumulator_deps = self._expand_workflow_dependencies(
+                    self._workflow_accumulator_nodes[dep_id].get("dependencies", []),
+                    workflow_node_ids,
+                    seen | {dep_id},
+                )
+                for accumulator_dep in accumulator_deps:
+                    if accumulator_dep not in expanded:
+                        expanded.append(accumulator_dep)
                 continue
             if dep_id in workflow_node_ids:
                 continue
@@ -999,6 +1377,11 @@ class _SubjectiveDataSourcePipelineRunner:
 
     def _instantiate_node(self, node: _V2PipelineNode):
         config = self._runtime_config(node)
+        if getattr(node, "internal_data", None):
+            config["internal_data"] = dict(node.internal_data)
+        config["pipeline_stop_event"] = self._stop_event
+        config["pipeline_started_check"] = lambda: self._started
+        config["pipeline_name"] = self.pipeline_name
         connection_data = self._resolve_connection_data(node.connection_name)
         api_version = getattr(node.data_source_class, "api_version", None)
         is_v2 = callable(api_version) and node.data_source_class.api_version() == "v2"
@@ -1320,6 +1703,8 @@ class _SubjectiveDataSourcePipelineRunner:
         field_name = field_name.strip()
         if source_node_id in self._workflow_start_node_ids:
             return _SKIP_PIPELINE_INPUT
+        if source_node_id in self._workflow_accumulator_nodes:
+            return self._resolve_accumulator_output(source_node_id, field_name, results)
         if source_node_id in self._workflow_iterator_nodes:
             return self._resolve_iterator_output(source_node_id, field_name, results)
         if source_node_id not in self.nodes:
@@ -1339,11 +1724,35 @@ class _SubjectiveDataSourcePipelineRunner:
         source_node_id, field_name = raw_value.split(".", 1)
         source_node_id = source_node_id.strip()
         field_name = field_name.strip()
+        if source_node_id in self._workflow_accumulator_nodes:
+            ready_value = results.get(source_node_id)
+            if isinstance(ready_value, dict):
+                return ready_value
+            return {"output": ready_value} if ready_value is not None else None
         if source_node_id in self._workflow_iterator_nodes:
             return {field_name: self._resolve_iterator_output(source_node_id, field_name, results)}
         if source_node_id not in self.nodes:
             return None
         return results.get(source_node_id)
+
+    def _resolve_accumulator_output(
+        self,
+        accumulator_node_id: str,
+        field_name: str,
+        results: Dict[str, Any],
+        skip_if_unready: bool = True,
+    ):
+        accumulator_result = results.get(accumulator_node_id)
+        if accumulator_result is None:
+            return _SKIP_PIPELINE_NODE if skip_if_unready else None
+
+        if isinstance(accumulator_result, dict):
+            if field_name in {"output", "*"}:
+                return copy.deepcopy(accumulator_result.get("output"))
+            return copy.deepcopy(accumulator_result.get(field_name))
+        if field_name in {"output", "*"}:
+            return copy.deepcopy(accumulator_result)
+        return None
 
     def _resolve_iterator_output(self, iterator_node_id: str, field_name: str, results: Dict[str, Any]):
         iterator_node = self._workflow_iterator_nodes.get(iterator_node_id) or {}
@@ -1354,16 +1763,22 @@ class _SubjectiveDataSourcePipelineRunner:
             return None
 
         items: List[Any] = []
+        blocked = False
         for port_name in self._sorted_iterator_port_names(raw_inputs):
             raw_port_value = raw_inputs.get(port_name)
             for candidate in self._iter_iterator_raw_values(raw_port_value):
                 resolved = self._resolve_iterator_input_reference(candidate, results)
-                if resolved in (_SKIP_PIPELINE_INPUT, _SKIP_PIPELINE_NODE, None):
+                if resolved in (_SKIP_PIPELINE_INPUT, None):
+                    continue
+                if resolved is _SKIP_PIPELINE_NODE:
+                    blocked = True
                     continue
                 if isinstance(resolved, list):
                     items.extend(copy.deepcopy(resolved))
                 else:
                     items.append(copy.deepcopy(resolved))
+        if blocked and not items:
+            return _SKIP_PIPELINE_NODE
         return items
 
     def _sorted_iterator_port_names(self, raw_inputs: Dict[str, Any]) -> List[str]:
@@ -1393,6 +1808,8 @@ class _SubjectiveDataSourcePipelineRunner:
         source_node_id, field_name = raw_value.split(".", 1)
         source_node_id = source_node_id.strip()
         field_name = field_name.strip()
+        if source_node_id in self._workflow_accumulator_nodes:
+            return self._resolve_accumulator_output(source_node_id, field_name, results)
         source_value = results.get(source_node_id)
         if isinstance(source_value, dict):
             return source_value.get(field_name)
@@ -1625,12 +2042,9 @@ class _SubjectiveDataSourcePipelineRunner:
         downstream_nodes = self._get_downstream_nodes(node.node_id)
         if node.terminal or not downstream_nodes:
             os.makedirs(self.context_dir, exist_ok=True)
-            ds_type = node.data_source_class.__name__.replace("Subjective", "").replace("DataSource", "")
-            stamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
             for file_name in files:
                 source_path = os.path.join(output_dir, file_name)
-                context_name = f"{stamp}-{ds_type}-{node.node_id}-context.json"
-                destination = self._unique_destination(self.context_dir, context_name)
+                destination = self._unique_destination(self.context_dir, f"{node.node_id}-{file_name}")
                 shutil.move(source_path, destination)
             return
 

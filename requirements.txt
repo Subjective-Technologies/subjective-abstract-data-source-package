@@ -2,3 +2,4 @@ brainboost-data-source-logger-package @ git+https://github.com/Subjective-Techno
 brainboost-configuration-package @ git+https://github.com/Subjective-Technologies/brainboost_configuration_package.git
 alive-progress>=3.1.5
 pandas>=1.5.0
+croniter>=2.0.5
