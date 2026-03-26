@@ -362,8 +362,70 @@ class SubjectiveDataSource(ABC):
         )
         return data_source_type_name
 
-    def _sanitize_label(self, value):
+    @staticmethod
+    def sanitize_context_label(value):
         return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(value))
+
+    def _sanitize_label(self, value):
+        return self.sanitize_context_label(value)
+
+    @classmethod
+    def build_context_filename(
+        cls,
+        *,
+        datasource_name: str,
+        connection_label: str | None = None,
+        output_format: str | None = None,
+        name_convention: str | None = None,
+        timestamp: str | None = None,
+    ) -> str:
+        try:
+            default_output_format = BBConfig.get("CONTEXT_OUTPUT_FORMAT")
+        except Exception:
+            default_output_format = None
+        try:
+            default_name_convention = BBConfig.get("CONTEXT_FILE_NAME_CONVENTION")
+        except Exception:
+            default_name_convention = None
+
+        resolved_output_format = str(output_format or default_output_format or "json").strip() or "json"
+        resolved_name_convention = str(
+            name_convention
+            or default_name_convention
+            or "YYYY_MM_DD_HH_MM_SS-[ds_name]-context.${CONTEXT_OUTPUT_FORMAT}"
+        ).strip()
+        resolved_connection_label = cls.sanitize_context_label(connection_label) if connection_label else None
+        resolved_datasource_name = str(datasource_name or "unknown").strip() or "unknown"
+        if resolved_connection_label and "[connection_name]" not in resolved_name_convention:
+            resolved_datasource_name = f"{resolved_datasource_name}-{resolved_connection_label}"
+        resolved_timestamp = timestamp or datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+
+        filename = resolved_name_convention.replace("YYYY_MM_DD_HH_MM_SS", resolved_timestamp)
+        filename = filename.replace("[ds_name]", resolved_datasource_name)
+        if "[connection_name]" in filename:
+            filename = filename.replace("[connection_name]", resolved_connection_label or "unknown")
+        filename = filename.replace("${CONTEXT_OUTPUT_FORMAT}", resolved_output_format)
+        return filename
+
+    @classmethod
+    def build_context_stem(
+        cls,
+        *,
+        datasource_name: str,
+        connection_label: str | None = None,
+        output_format: str | None = None,
+        name_convention: str | None = None,
+        timestamp: str | None = None,
+    ) -> str:
+        filename = cls.build_context_filename(
+            datasource_name=datasource_name,
+            connection_label=connection_label,
+            output_format=output_format,
+            name_convention=name_convention,
+            timestamp=timestamp,
+        )
+        stem, _ = os.path.splitext(filename)
+        return stem
 
     def _get_connection_label(self):
         connection_name = self.connection_name
@@ -540,20 +602,15 @@ class SubjectiveDataSource(ABC):
             return ""
         os.makedirs(context_dir, exist_ok=True)
 
-        datasource_name = self.get_data_source_type_name()
         output_format = self._safe_get_config_value("CONTEXT_OUTPUT_FORMAT") or "json"
         name_convention = self._safe_get_config_value("CONTEXT_FILE_NAME_CONVENTION")
-        if not name_convention:
-            name_convention = "YYYY_MM_DD_HH_MM_SS-[ds_name]-context.${CONTEXT_OUTPUT_FORMAT}"
         connection_label = self._get_connection_label()
-        if connection_label and "[connection_name]" not in name_convention:
-            datasource_name = f"{datasource_name}-{connection_label}"
-        ts = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
-        filename = name_convention.replace("YYYY_MM_DD_HH_MM_SS", ts)
-        filename = filename.replace("[ds_name]", datasource_name)
-        if "[connection_name]" in filename:
-            filename = filename.replace("[connection_name]", connection_label or "unknown")
-        filename = filename.replace("${CONTEXT_OUTPUT_FORMAT}", output_format)
+        filename = self.build_context_filename(
+            datasource_name=self.get_data_source_type_name(),
+            connection_label=connection_label,
+            output_format=output_format,
+            name_convention=name_convention,
+        )
         path = os.path.join(context_dir, filename)
 
         payload = data

@@ -569,13 +569,21 @@ class _V2PipelineNode:
     connection_name: str
     inputs: Dict[str, Any] = field(default_factory=dict)
     selected_action: str = ""
-    terminal: bool = False
+    send_to_context: bool = False
     dependencies: List[str] = field(default_factory=list)
     filter_expr: str = ""
     transform_expr: str = ""
     internal_data: Dict[str, Any] = field(default_factory=dict)
     data_source_class: Any = None
     instance: Any = None
+
+    @property
+    def terminal(self) -> bool:
+        return self.send_to_context
+
+    @terminal.setter
+    def terminal(self, value: bool) -> None:
+        self.send_to_context = bool(value)
 
 
 _SKIP_PIPELINE_NODE = object()
@@ -775,16 +783,21 @@ class _SubjectiveDataSourcePipelineRunner:
             else:
                 self._iterated_nodes.discard(node_id)
                 results[node_id] = execution_results[-1] if execution_results else {}
+            stored = results[node_id]
+            stored_summary = sorted(stored.keys()) if isinstance(stored, dict) else type(stored).__name__
+            BBLogger.log(
+                f"[Pipeline:batch] {node_id} result stored in results dict: {stored_summary}"
+            )
             self._bump_result_version(node_id)
             self._refresh_workflow_accumulators(results, changed_node_id=node_id)
 
     def _finalize_results(self, results: Dict[str, Any]):
-        terminal_nodes = [n.node_id for n in self.nodes.values() if n.terminal]
-        if not terminal_nodes and self.nodes:
-            terminal_nodes = [self._topological_order()[-1]]
-        if len(terminal_nodes) == 1:
-            return results.get(terminal_nodes[0])
-        return {node_id: results.get(node_id) for node_id in terminal_nodes}
+        result_nodes = [n.node_id for n in self.nodes.values() if n.send_to_context]
+        if not result_nodes and self.nodes:
+            result_nodes = [self._topological_order()[-1]]
+        if len(result_nodes) == 1:
+            return results.get(result_nodes[0])
+        return {node_id: results.get(node_id) for node_id in result_nodes}
 
     def _is_v2_node(self, node: _V2PipelineNode) -> bool:
         api_version = getattr(node.data_source_class, "api_version", None)
@@ -1260,7 +1273,10 @@ class _SubjectiveDataSourcePipelineRunner:
                     or internal_data.get("selected_action")
                     or ""
                 ).strip(),
-                terminal=bool(raw_node.get("terminal", False) or node_id in terminal_source_ids),
+                send_to_context=bool(
+                    raw_node.get("send_to_context", raw_node.get("terminal", False))
+                    or node_id in terminal_source_ids
+                ),
                 dependencies=list(dict.fromkeys(dependencies)),
                 filter_expr=str(raw_node.get("filter") or ""),
                 transform_expr=str(raw_node.get("transform") or ""),
@@ -1483,6 +1499,18 @@ class _SubjectiveDataSourcePipelineRunner:
                     request[dep_id] = dep_value
         else:
             request = dict(initial_request)
+
+        def _summarize_value(v, max_len=100):
+            s = str(v)
+            return s[:max_len] + "..." if len(s) > max_len else s
+
+        request_summary = {
+            k: _summarize_value(v) for k, v in request.items()
+        } if isinstance(request, dict) else type(request).__name__
+        source = "inputs" if node.inputs else ("dependencies" if node.dependencies else "initial_request")
+        BBLogger.log(
+            f"[Pipeline:request] {node.node_id} built request from {source}: {request_summary}"
+        )
         return request, iteration_specs
 
     def _build_iteration_spec(self, request_key: str, raw_value: Any, resolved: Any) -> Dict[str, Any] | None:
@@ -1716,10 +1744,33 @@ class _SubjectiveDataSourcePipelineRunner:
         if source_node_id not in self.nodes:
             return raw_value
         source_value = results.get(source_node_id)
+        if source_value is None:
+            BBLogger.log(
+                f"[Pipeline:resolve] {node.node_id} input '{raw_value}': "
+                f"source node '{source_node_id}' has no result yet → None"
+            )
+            return None
         if field_name == "*":
-            return self._remap_result_files(node, source_node_id, source_value)
+            resolved = self._remap_result_files(node, source_node_id, source_value)
+            BBLogger.log(
+                f"[Pipeline:resolve] {node.node_id} input '{raw_value}': "
+                f"resolved wildcard from '{source_node_id}' "
+                f"keys={sorted(source_value.keys()) if isinstance(source_value, dict) else type(source_value).__name__}"
+            )
+            return resolved
         if isinstance(source_value, dict):
-            return self._remap_result_files(node, source_node_id, source_value.get(field_name))
+            field_value = source_value.get(field_name)
+            resolved = self._remap_result_files(node, source_node_id, field_value)
+            preview = str(resolved)[:120] if resolved is not None else "None"
+            BBLogger.log(
+                f"[Pipeline:resolve] {node.node_id} input '{raw_value}': "
+                f"'{source_node_id}'.'{field_name}' → {preview}"
+            )
+            return resolved
+        BBLogger.log(
+            f"[Pipeline:resolve] {node.node_id} input '{raw_value}': "
+            f"source '{source_node_id}' is not a dict ({type(source_value).__name__}) → None"
+        )
         return None
 
     def _source_result_for_reference(self, raw_value: Any, results: Dict[str, Any]) -> Any:
@@ -1898,17 +1949,20 @@ class _SubjectiveDataSourcePipelineRunner:
         input_dir_override: Optional[str] = None,
     ) -> Dict[str, Any]:
         input_dir = input_dir_override or self._ensure_node_dirs(node.node_id)[0]
+        staged_files: List[str] = []
 
-        def _convert(value):
+        def _convert(value, key_path=""):
             if isinstance(value, dict):
-                return {k: _convert(v) for k, v in value.items()}
+                return {k: _convert(v, f"{key_path}.{k}" if key_path else k) for k, v in value.items()}
             if isinstance(value, list):
-                return [_convert(v) for v in value]
+                return [_convert(v, f"{key_path}[{i}]") for i, v in enumerate(value)]
             if isinstance(value, str) and value and os.path.isfile(value):
                 if os.path.abspath(os.path.dirname(value)) == os.path.abspath(input_dir):
+                    staged_files.append(f"{key_path}: already in input/ ({os.path.basename(value)})")
                     return value
                 destination = self._unique_destination(input_dir, os.path.basename(value))
                 shutil.copy2(value, destination)
+                staged_files.append(f"{key_path}: copied {os.path.basename(value)} → input/")
                 return destination
             if isinstance(value, str):
                 basename = os.path.basename(value)
@@ -1920,10 +1974,17 @@ class _SubjectiveDataSourcePipelineRunner:
                         input_dir_override=input_dir,
                     )
                     if remapped != value:
+                        staged_files.append(f"{key_path}: remapped → {os.path.basename(remapped)}")
                         return remapped
             return value
 
-        return _convert(request)
+        result = _convert(request)
+        if staged_files:
+            BBLogger.log(
+                f"[Pipeline:stage] {node.node_id} staged {len(staged_files)} file(s): "
+                + "; ".join(staged_files)
+            )
+        return result
 
     def _execute_node(
         self,
@@ -2022,8 +2083,92 @@ class _SubjectiveDataSourcePipelineRunner:
 
     def _write_result_envelope(self, node: _V2PipelineNode, result: Any):
         _, output_dir, _ = self._ensure_node_dirs(node.node_id)
-        with open(os.path.join(output_dir, "output.json"), "w", encoding="utf-8") as fh:
+        envelope_path = os.path.join(output_dir, "output.json")
+        with open(envelope_path, "w", encoding="utf-8") as fh:
             json.dump(result, fh, indent=2, default=str)
+        result_keys = sorted(result.keys()) if isinstance(result, dict) else type(result).__name__
+        BBLogger.log(
+            f"[Pipeline:io] {node.node_id} wrote envelope to output/output.json "
+            f"keys={result_keys}"
+        )
+
+    def _node_context_datasource_name(self, node: _V2PipelineNode) -> str:
+        if node.instance is not None and hasattr(node.instance, "get_data_source_type_name"):
+            try:
+                datasource_name = str(node.instance.get_data_source_type_name() or "").strip()
+                if datasource_name:
+                    return datasource_name
+            except Exception:
+                pass
+
+        class_name = ""
+        if node.data_source_class is not None:
+            class_name = str(getattr(node.data_source_class, "__name__", "") or "").strip()
+        if not class_name:
+            class_name = str(node.class_name or node.node_id or "unknown").strip()
+        datasource_name = (
+            class_name
+            .replace("Subjective", "")
+            .replace("RealTimeDataSource", "")
+            .replace("OnDemandDataSource", "")
+            .replace("PipelineDataSource", "Pipeline")
+            .replace("DataSource", "")
+        )
+        return datasource_name or node.node_id
+
+    def _node_context_connection_label(self, node: _V2PipelineNode) -> str | None:
+        label = str(node.connection_name or "").strip()
+        if not label:
+            return None
+        return SubjectiveDataSource.sanitize_context_label(label)
+
+    def _context_destination_name(
+        self,
+        node: _V2PipelineNode,
+        file_name: str,
+        *,
+        timestamp: str,
+    ) -> str:
+        datasource_name = self._node_context_datasource_name(node)
+        connection_label = self._node_context_connection_label(node)
+        if file_name == "output.json":
+            return SubjectiveDataSource.build_context_filename(
+                datasource_name=datasource_name,
+                connection_label=connection_label,
+                output_format="json",
+                timestamp=timestamp,
+            )
+
+        stem = SubjectiveDataSource.build_context_stem(
+            datasource_name=datasource_name,
+            connection_label=connection_label,
+            output_format="json",
+            timestamp=timestamp,
+        )
+        return f"{stem}-{file_name}"
+
+    def _promote_output_files_to_context(
+        self,
+        node: _V2PipelineNode,
+        files: List[str],
+        output_dir: str,
+        *,
+        move_files: bool,
+    ) -> None:
+        os.makedirs(self.context_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+        for file_name in files:
+            source_path = os.path.join(output_dir, file_name)
+            if not os.path.isfile(source_path):
+                continue
+            destination = self._unique_destination(
+                self.context_dir,
+                self._context_destination_name(node, file_name, timestamp=timestamp),
+            )
+            if move_files:
+                shutil.move(source_path, destination)
+            else:
+                shutil.copy2(source_path, destination)
 
     def _get_downstream_nodes(self, source_node_id: str) -> List[_V2PipelineNode]:
         return [node for node in self.nodes.values() if source_node_id in node.dependencies]
@@ -2046,25 +2191,47 @@ class _SubjectiveDataSourcePipelineRunner:
             return
 
         downstream_nodes = self._get_downstream_nodes(node.node_id)
-        if node.terminal or not downstream_nodes:
-            os.makedirs(self.context_dir, exist_ok=True)
-            for file_name in files:
-                source_path = os.path.join(output_dir, file_name)
-                destination = self._unique_destination(self.context_dir, f"{node.node_id}-{file_name}")
-                shutil.move(source_path, destination)
+        has_downstream = bool(downstream_nodes)
+        downstream_ids = [n.node_id for n in downstream_nodes]
+        BBLogger.log(
+            f"[Pipeline:io] {node.node_id} routing {len(files)} file(s) from output/: "
+            f"{files} → downstream={downstream_ids} send_to_context={node.send_to_context}"
+        )
+
+        if node.send_to_context or not has_downstream:
+            action = "move" if not has_downstream else "copy"
+            BBLogger.log(
+                f"[Pipeline:io] {node.node_id} promoting {len(files)} file(s) to context ({action})"
+            )
+            self._promote_output_files_to_context(
+                node,
+                files,
+                output_dir,
+                move_files=not has_downstream,
+            )
+            if not has_downstream:
+                return
+
+        files = [name for name in files if os.path.isfile(os.path.join(output_dir, name))]
+        if not files:
             return
 
         stamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S_%f")[:23]
         for file_name in files:
             source_path = os.path.join(output_dir, file_name)
+            stamped_name = f"{stamp}-{node.node_id}.{file_name}"
             destinations = []
             for downstream_node in downstream_nodes:
                 input_dir, _, _ = self._ensure_node_dirs(downstream_node.node_id)
                 destinations.append(
                     self._unique_destination(
                         input_dir,
-                        f"{stamp}-{node.node_id}.{file_name}",
+                        stamped_name,
                     )
+                )
+                BBLogger.log(
+                    f"[Pipeline:io] {node.node_id} → {downstream_node.node_id}/input/ "
+                    f"{file_name} as {stamped_name}"
                 )
 
             if len(destinations) == 1:
@@ -2107,7 +2274,7 @@ class SubjectivePipelineDataSource(SubjectiveDataSource):
         return {
             "pipeline_result": {
                 "type": "dict",
-                "description": "Result returned by the pipeline terminal node(s)",
+                "description": "Result returned by the pipeline final node(s)",
             }
         }
 
