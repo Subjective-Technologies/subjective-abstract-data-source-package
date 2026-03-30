@@ -900,40 +900,6 @@ class _SubjectiveDataSourcePipelineRunner:
             return item.get("value")
         return item
 
-    def _accumulator_filter_allows(
-        self,
-        accumulator_node_id: str,
-        accumulator_node: Dict[str, Any],
-        *,
-        port_name: str,
-        index: int,
-        raw_value: Any,
-        resolved: Any,
-    ) -> bool:
-        filter_expr = str(accumulator_node.get("filter_expr") or "").strip()
-        if not filter_expr:
-            return True
-
-        filter_data = {
-            str(port_name or "input"): copy.deepcopy(resolved),
-            "_port_name": str(port_name or ""),
-            "_index": int(index),
-            "_reference": str(raw_value or "") if isinstance(raw_value, str) else "",
-        }
-        try:
-            return bool(
-                eval(
-                    filter_expr,
-                    {"__builtins__": {}},
-                    {"data": filter_data, "str": str, "int": int, "float": float},
-                )
-            )
-        except Exception as exc:
-            BBLogger.log(
-                f"Pipeline accumulator filter error for '{accumulator_node_id}': {exc}"
-            )
-            return False
-
     def _accumulator_reference_marker(self, raw_value: Any, results: Dict[str, Any]) -> Any:
         if isinstance(raw_value, dict) and "from" in raw_value:
             raw_value = raw_value.get("from")
@@ -1054,15 +1020,6 @@ class _SubjectiveDataSourcePipelineRunner:
                 if resolved in (None, _SKIP_PIPELINE_INPUT, _SKIP_PIPELINE_NODE):
                     continue
                 markers[ref_key] = marker
-                if not self._accumulator_filter_allows(
-                    accumulator_node_id,
-                    accumulator_node,
-                    port_name=port_name,
-                    index=index,
-                    raw_value=raw_value,
-                    resolved=resolved,
-                ):
-                    continue
                 pending_items.append(self._make_accumulator_buffer_item(raw_order, resolved))
 
             if pending_items:
@@ -1309,7 +1266,6 @@ class _SubjectiveDataSourcePipelineRunner:
                         "class_name": cls,
                         "inputs": raw_inputs,
                         "dependencies": self._extract_dependencies(raw_inputs, known_node_ids=known_node_ids),
-                        "filter_expr": str(raw_node.get("filter") or ""),
                         "config": normalize_pipeline_accumulator_config(
                             raw_node.get("internal_data") if isinstance(raw_node.get("internal_data"), dict) else {}
                         ),
