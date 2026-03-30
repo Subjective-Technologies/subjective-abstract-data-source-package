@@ -43,6 +43,10 @@ PIPELINE_TICKER_UNIT_TO_SECONDS = {
     "min": 60.0,
     "hour": 3600.0,
 }
+PIPELINE_OUTPUT_BATCH_STAMP_RE = re.compile(
+    r"^(?P<stamp>\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2}_\d{3})-"
+)
+PIPELINE_SAFE_PORT_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]")
 
 
 def _inline_ticker_wait_seconds(ticker_config: Dict[str, Any], cron_iter=None) -> float:
@@ -775,7 +779,6 @@ class _SubjectiveDataSourcePipelineRunner:
                     input_dir_override=execution_plan.get("input_dir"),
                 )
                 execution_results.append(result)
-                self._route_output_files(node)
 
             if iteration_specs:
                 results[node_id] = self._aggregate_iteration_results(execution_results)
@@ -806,6 +809,8 @@ class _SubjectiveDataSourcePipelineRunner:
     def _is_streaming_node(self, node: _V2PipelineNode) -> bool:
         if str(node.class_name or "").strip() == "__ticker__":
             return True
+        if str(node.class_name or "").strip() == "SubjectivePipelineDataSource":
+            return False
         if node.instance is None:
             node.instance = self._instantiate_node(node)
         if hasattr(node.instance, "supports_streaming"):
@@ -993,6 +998,7 @@ class _SubjectiveDataSourcePipelineRunner:
             if pending_items:
                 self._accumulator_buffers.setdefault(accumulator_node_id, []).extend(pending_items)
 
+            buffered_count = len(self._accumulator_buffers.setdefault(accumulator_node_id, []))
             released_value = self._maybe_release_accumulator(accumulator_node_id)
             if released_value is None:
                 continue
@@ -1001,7 +1007,7 @@ class _SubjectiveDataSourcePipelineRunner:
             self._bump_result_version(accumulator_node_id)
             BBLogger.log(
                 f"[Pipeline:accumulator] Released {accumulator_node_id} "
-                f"count={len(pending_items)} threshold="
+                f"added={len(pending_items)} buffered={buffered_count} released={buffered_count} threshold="
                 f"{accumulator_node.get('config', {}).get('threshold', 5)} "
                 f"mode={accumulator_node.get('config', {}).get('release_mode', 'array')}"
             )
@@ -1030,8 +1036,18 @@ class _SubjectiveDataSourcePipelineRunner:
         self._stream_threads = []
 
         def _publish_stream_event(node: _V2PipelineNode, item: Any) -> None:
-            self._write_result_envelope(node, item)
-            self._route_output_files(node)
+            batch_stamp = self._new_output_batch_stamp()
+            written_port_files = self._write_output_port_files(
+                node,
+                item,
+                batch_stamp=batch_stamp,
+            )
+            self._route_output_files(
+                node,
+                batch_stamp=batch_stamp,
+                result=item,
+                written_port_files=written_port_files,
+            )
             summary = list(item.keys()) if isinstance(item, dict) else type(item).__name__
             BBLogger.log(f"[Pipeline:event] Published stream event from {node.node_id}: {summary}")
             event_queue.put(("event", node.node_id, item))
@@ -1417,6 +1433,17 @@ class _SubjectiveDataSourcePipelineRunner:
                 return node.data_source_class(connection=connection_data, config=config)
 
             params = dict(connection_data)
+            if isinstance(getattr(node, "internal_data", None), dict) and node.internal_data:
+                params.update(node.internal_data)
+                pipeline_path = str(
+                    node.internal_data.get("pipeline_json_path")
+                    or node.internal_data.get("pipeline_file")
+                    or node.internal_data.get("pipeline_path")
+                    or ""
+                ).strip()
+                if pipeline_path:
+                    params.setdefault("pipeline_json_path", pipeline_path)
+                    params.setdefault("pipeline_file", pipeline_path)
             params["connection_name"] = node.connection_name
             params["TARGET_DIRECTORY"] = config["output_dir"]
             params["target_directory"] = config["output_dir"]
@@ -1480,6 +1507,13 @@ class _SubjectiveDataSourcePipelineRunner:
                     return _SKIP_PIPELINE_NODE, []
                 if resolved is _SKIP_PIPELINE_INPUT:
                     continue
+                if self._should_skip_node_for_unresolved_input(key, raw_value, resolved):
+                    ref_text = self._reference_text(raw_value)
+                    BBLogger.log(
+                        f"[Pipeline:request] {node.node_id} unresolved reference "
+                        f"for input '{key}' ({ref_text}) -> skip node"
+                    )
+                    return _SKIP_PIPELINE_NODE, []
                 if key in ("*", "$default") and isinstance(resolved, dict):
                     request.update(resolved)
                 elif key in ("*", "$default"):
@@ -1512,6 +1546,44 @@ class _SubjectiveDataSourcePipelineRunner:
             f"[Pipeline:request] {node.node_id} built request from {source}: {request_summary}"
         )
         return request, iteration_specs
+
+    def _reference_text(self, raw_value: Any) -> str:
+        if isinstance(raw_value, dict) and "from" in raw_value:
+            return str(raw_value.get("from") or "").strip()
+        return str(raw_value or "").strip()
+
+    def _pipeline_reference_target(self, raw_value: Any) -> tuple[str, str] | None:
+        source_ref = self._reference_text(raw_value)
+        if "." not in source_ref or source_ref.startswith("$"):
+            return None
+
+        source_node_id, field_name = source_ref.split(".", 1)
+        source_node_id = source_node_id.strip()
+        field_name = field_name.strip()
+        if not source_node_id:
+            return None
+
+        if source_node_id in self.nodes:
+            return source_node_id, field_name
+        if source_node_id in self._workflow_accumulator_nodes:
+            return source_node_id, field_name
+        if source_node_id in self._workflow_iterator_nodes:
+            return source_node_id, field_name
+        if source_node_id in self._workflow_start_node_ids:
+            return source_node_id, field_name
+        return None
+
+    def _should_skip_node_for_unresolved_input(
+        self,
+        request_key: str,
+        raw_value: Any,
+        resolved: Any,
+    ) -> bool:
+        if resolved is not None:
+            return False
+        if request_key not in {"*", "$default"}:
+            return False
+        return self._pipeline_reference_target(raw_value) is not None
 
     def _build_iteration_spec(self, request_key: str, raw_value: Any, resolved: Any) -> Dict[str, Any] | None:
         if request_key in ("*", "$default"):
@@ -2018,8 +2090,18 @@ class _SubjectiveDataSourcePipelineRunner:
                     stream_results: List[Any] = []
                     for item in node.instance.stream(request):
                         stream_results.append(item)
-                        self._write_result_envelope(node, item)
-                        self._route_output_files(node)
+                        batch_stamp = self._new_output_batch_stamp()
+                        written_port_files = self._write_output_port_files(
+                            node,
+                            item,
+                            batch_stamp=batch_stamp,
+                        )
+                        self._route_output_files(
+                            node,
+                            batch_stamp=batch_stamp,
+                            result=item,
+                            written_port_files=written_port_files,
+                        )
                     if len(stream_results) > 1:
                         result = self._aggregate_iteration_results(stream_results)
                     else:
@@ -2053,6 +2135,8 @@ class _SubjectiveDataSourcePipelineRunner:
                     result = node.instance.process_input(request)
                     if result is None and collector:
                         result = collector[-1]
+                elif str(node.class_name or "").strip() == "SubjectivePipelineDataSource":
+                    result = node.instance.run(request or {})
                 else:
                     result = node.instance.fetch()
                     if result is None and collector:
@@ -2078,19 +2162,146 @@ class _SubjectiveDataSourcePipelineRunner:
                     node.instance._config["input_dir"] = original_input_dir
 
         if result is not None:
-            self._write_result_envelope(node, result)
+            batch_stamp = self._new_output_batch_stamp()
+            written_port_files = self._write_output_port_files(
+                node,
+                result,
+                batch_stamp=batch_stamp,
+            )
+            self._route_output_files(
+                node,
+                batch_stamp=batch_stamp,
+                result=result,
+                written_port_files=written_port_files,
+            )
+        else:
+            batch_stamp = self._new_output_batch_stamp()
+            self._route_output_files(
+                node,
+                batch_stamp=batch_stamp,
+            )
         return result
 
-    def _write_result_envelope(self, node: _V2PipelineNode, result: Any):
-        _, output_dir, _ = self._ensure_node_dirs(node.node_id)
-        envelope_path = os.path.join(output_dir, "output.json")
-        with open(envelope_path, "w", encoding="utf-8") as fh:
-            json.dump(result, fh, indent=2, default=str)
-        result_keys = sorted(result.keys()) if isinstance(result, dict) else type(result).__name__
-        BBLogger.log(
-            f"[Pipeline:io] {node.node_id} wrote envelope to output/output.json "
-            f"keys={result_keys}"
+    def _new_output_batch_stamp(self) -> str:
+        return datetime.now().strftime("%Y_%m_%d_%H_%M_%S_%f")[:23]
+
+    def _context_timestamp_for_batch(self, batch_stamp: str | None) -> str:
+        if batch_stamp and PIPELINE_OUTPUT_BATCH_STAMP_RE.match(batch_stamp + "-"):
+            return batch_stamp.rsplit("_", 1)[0]
+        return datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+
+    def _coerce_result_payload(self, result: Any) -> Dict[str, Any] | None:
+        if result is None:
+            return None
+        if isinstance(result, dict):
+            return result
+        return {"output": result}
+
+    def _sanitize_port_file_name(self, port_name: Any) -> str:
+        text = str(port_name or "").strip()
+        if not text:
+            return ""
+        safe = PIPELINE_SAFE_PORT_NAME_RE.sub("_", text)
+        safe = re.sub(r"_+", "_", safe)
+        return safe.strip("._")
+
+    def _build_stamped_output_name(
+        self,
+        node: _V2PipelineNode,
+        batch_stamp: str,
+        file_name: str,
+    ) -> str:
+        return f"{batch_stamp}-{node.node_id}.{file_name}"
+
+    def _split_stamped_output_name(
+        self,
+        node: _V2PipelineNode,
+        file_name: str,
+    ) -> tuple[str, str] | None:
+        pattern = (
+            rf"^(?P<stamp>\d{{4}}_\d{{2}}_\d{{2}}_\d{{2}}_\d{{2}}_\d{{2}}_\d{{3}})-"
+            rf"{re.escape(node.node_id)}\.(?P<original>.+)$"
         )
+        match = re.match(pattern, file_name)
+        if not match:
+            return None
+        return match.group("stamp"), match.group("original")
+
+    def _normalize_output_batch_files(
+        self,
+        node: _V2PipelineNode,
+        output_dir: str,
+        batch_stamp: str,
+    ) -> List[str]:
+        if not os.path.isdir(output_dir):
+            return []
+
+        for file_name in sorted(os.listdir(output_dir)):
+            source_path = os.path.join(output_dir, file_name)
+            if not os.path.isfile(source_path):
+                continue
+            if self._split_stamped_output_name(node, file_name):
+                continue
+
+            stamped_name = self._build_stamped_output_name(node, batch_stamp, file_name)
+            destination = self._unique_destination(output_dir, stamped_name)
+            shutil.move(source_path, destination)
+            BBLogger.log(
+                f"[Pipeline:io] {node.node_id} normalized output file: {file_name} -> {os.path.basename(destination)}"
+            )
+
+        return sorted(
+            name
+            for name in os.listdir(output_dir)
+            if os.path.isfile(os.path.join(output_dir, name))
+        )
+
+    def _write_output_port_files(
+        self,
+        node: _V2PipelineNode,
+        result: Any,
+        *,
+        batch_stamp: str,
+    ) -> set[str]:
+        if result is None:
+            return set()
+
+        payload = self._coerce_result_payload(result) or {}
+        _, output_dir, _ = self._ensure_node_dirs(node.node_id)
+        written_files: set[str] = set()
+
+        for port_name, value in payload.items():
+            raw_port_name = str(port_name or "").strip()
+            safe_port_name = self._sanitize_port_file_name(port_name)
+            if not safe_port_name or value is None:
+                continue
+
+            if isinstance(value, (dict, list)):
+                original_file_name = f"{safe_port_name}.json"
+                serialized = json.dumps(value, indent=2, default=str)
+            else:
+                original_file_name = f"{safe_port_name}.txt"
+                serialized = str(value)
+
+            stamped_name = self._build_stamped_output_name(node, batch_stamp, original_file_name)
+            file_path = self._unique_destination(output_dir, stamped_name)
+            with open(file_path, "w", encoding="utf-8") as fh:
+                fh.write(serialized)
+
+            actual_file_name = os.path.basename(file_path)
+            written_files.add(actual_file_name)
+            byte_len = len(serialized.encode("utf-8"))
+            if raw_port_name and raw_port_name != safe_port_name:
+                BBLogger.log(
+                    f"[Pipeline:io] {node.node_id} wrote port file: {actual_file_name} "
+                    f"({byte_len} bytes) from port '{raw_port_name}'"
+                )
+            else:
+                BBLogger.log(
+                    f"[Pipeline:io] {node.node_id} wrote port file: {actual_file_name} "
+                    f"({byte_len} bytes)"
+                )
+        return written_files
 
     def _node_context_datasource_name(self, node: _V2PipelineNode) -> str:
         if node.instance is not None and hasattr(node.instance, "get_data_source_type_name"):
@@ -2125,27 +2336,36 @@ class _SubjectiveDataSourcePipelineRunner:
     def _context_destination_name(
         self,
         node: _V2PipelineNode,
+        *,
+        timestamp: str,
+    ) -> str:
+        datasource_name = self._node_context_datasource_name(node)
+        connection_label = self._node_context_connection_label(node)
+        return SubjectiveDataSource.build_context_filename(
+            datasource_name=datasource_name,
+            connection_label=connection_label,
+            output_format="json",
+            timestamp=timestamp,
+        )
+
+    def _context_artifact_destination_name(
+        self,
+        node: _V2PipelineNode,
         file_name: str,
         *,
         timestamp: str,
     ) -> str:
         datasource_name = self._node_context_datasource_name(node)
         connection_label = self._node_context_connection_label(node)
-        if file_name == "output.json":
-            return SubjectiveDataSource.build_context_filename(
-                datasource_name=datasource_name,
-                connection_label=connection_label,
-                output_format="json",
-                timestamp=timestamp,
-            )
-
         stem = SubjectiveDataSource.build_context_stem(
             datasource_name=datasource_name,
             connection_label=connection_label,
             output_format="json",
             timestamp=timestamp,
         )
-        return f"{stem}-{file_name}"
+        split_name = self._split_stamped_output_name(node, file_name)
+        original_file_name = split_name[1] if split_name else file_name
+        return f"{stem}-{original_file_name}"
 
     def _promote_output_files_to_context(
         self,
@@ -2154,21 +2374,46 @@ class _SubjectiveDataSourcePipelineRunner:
         output_dir: str,
         *,
         move_files: bool,
+        result: Any = None,
+        written_port_files: set[str] | None = None,
+        batch_stamp: str | None = None,
     ) -> None:
         os.makedirs(self.context_dir, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+        timestamp = self._context_timestamp_for_batch(batch_stamp)
+        payload = self._coerce_result_payload(result)
+        written_port_files = set(written_port_files or set())
+
+        if payload is not None:
+            context_destination = self._unique_destination(
+                self.context_dir,
+                self._context_destination_name(node, timestamp=timestamp),
+            )
+            with open(context_destination, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2, ensure_ascii=False, default=str)
+            BBLogger.log(
+                f"[Pipeline:io] {node.node_id} wrote context file: {os.path.basename(context_destination)}"
+            )
+
         for file_name in files:
+            if file_name in written_port_files:
+                continue
             source_path = os.path.join(output_dir, file_name)
             if not os.path.isfile(source_path):
                 continue
             destination = self._unique_destination(
                 self.context_dir,
-                self._context_destination_name(node, file_name, timestamp=timestamp),
+                self._context_artifact_destination_name(node, file_name, timestamp=timestamp),
             )
             if move_files:
                 shutil.move(source_path, destination)
             else:
                 shutil.copy2(source_path, destination)
+
+        if move_files:
+            for file_name in written_port_files:
+                source_path = os.path.join(output_dir, file_name)
+                if os.path.isfile(source_path):
+                    os.remove(source_path)
 
     def _get_downstream_nodes(self, source_node_id: str) -> List[_V2PipelineNode]:
         return [node for node in self.nodes.values() if source_node_id in node.dependencies]
@@ -2182,11 +2427,23 @@ class _SubjectiveDataSourcePipelineRunner:
             counter += 1
         return candidate
 
-    def _route_output_files(self, node: _V2PipelineNode):
+    def _route_output_files(
+        self,
+        node: _V2PipelineNode,
+        *,
+        batch_stamp: str | None = None,
+        result: Any = None,
+        written_port_files: set[str] | None = None,
+    ):
         _, output_dir, _ = self._ensure_node_dirs(node.node_id)
         if not os.path.isdir(output_dir):
             return
-        files = [name for name in os.listdir(output_dir) if os.path.isfile(os.path.join(output_dir, name))]
+        if batch_stamp:
+            files = self._normalize_output_batch_files(node, output_dir, batch_stamp)
+        else:
+            files = sorted(
+                name for name in os.listdir(output_dir) if os.path.isfile(os.path.join(output_dir, name))
+            )
         if not files:
             return
 
@@ -2208,30 +2465,31 @@ class _SubjectiveDataSourcePipelineRunner:
                 files,
                 output_dir,
                 move_files=not has_downstream,
+                result=result,
+                written_port_files=written_port_files,
+                batch_stamp=batch_stamp,
             )
             if not has_downstream:
                 return
 
-        files = [name for name in files if os.path.isfile(os.path.join(output_dir, name))]
+        files = sorted(name for name in files if os.path.isfile(os.path.join(output_dir, name)))
         if not files:
             return
 
-        stamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S_%f")[:23]
         for file_name in files:
             source_path = os.path.join(output_dir, file_name)
-            stamped_name = f"{stamp}-{node.node_id}.{file_name}"
             destinations = []
             for downstream_node in downstream_nodes:
                 input_dir, _, _ = self._ensure_node_dirs(downstream_node.node_id)
                 destinations.append(
                     self._unique_destination(
                         input_dir,
-                        stamped_name,
+                        file_name,
                     )
                 )
                 BBLogger.log(
                     f"[Pipeline:io] {node.node_id} → {downstream_node.node_id}/input/ "
-                    f"{file_name} as {stamped_name}"
+                    f"{file_name}"
                 )
 
             if len(destinations) == 1:
