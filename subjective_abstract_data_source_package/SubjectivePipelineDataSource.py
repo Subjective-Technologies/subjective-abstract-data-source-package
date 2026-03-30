@@ -881,6 +881,59 @@ class _SubjectiveDataSourcePipelineRunner:
                 values.append((str(port_name or ""), 0, raw_value))
         return values
 
+    def _make_accumulator_buffer_item(self, order: int, value: Any) -> Dict[str, Any]:
+        return {
+            "order": int(order),
+            "value": copy.deepcopy(value),
+        }
+
+    def _accumulator_item_order(self, item: Any) -> int:
+        if isinstance(item, dict) and "order" in item and "value" in item:
+            try:
+                return int(item.get("order") or 0)
+            except Exception:
+                return 0
+        return 0
+
+    def _accumulator_item_value(self, item: Any) -> Any:
+        if isinstance(item, dict) and "order" in item and "value" in item:
+            return item.get("value")
+        return item
+
+    def _accumulator_filter_allows(
+        self,
+        accumulator_node_id: str,
+        accumulator_node: Dict[str, Any],
+        *,
+        port_name: str,
+        index: int,
+        raw_value: Any,
+        resolved: Any,
+    ) -> bool:
+        filter_expr = str(accumulator_node.get("filter_expr") or "").strip()
+        if not filter_expr:
+            return True
+
+        filter_data = {
+            str(port_name or "input"): copy.deepcopy(resolved),
+            "_port_name": str(port_name or ""),
+            "_index": int(index),
+            "_reference": str(raw_value or "") if isinstance(raw_value, str) else "",
+        }
+        try:
+            return bool(
+                eval(
+                    filter_expr,
+                    {"__builtins__": {}},
+                    {"data": filter_data, "str": str, "int": int, "float": float},
+                )
+            )
+        except Exception as exc:
+            BBLogger.log(
+                f"Pipeline accumulator filter error for '{accumulator_node_id}': {exc}"
+            )
+            return False
+
     def _accumulator_reference_marker(self, raw_value: Any, results: Dict[str, Any]) -> Any:
         if isinstance(raw_value, dict) and "from" in raw_value:
             raw_value = raw_value.get("from")
@@ -961,15 +1014,21 @@ class _SubjectiveDataSourcePipelineRunner:
             return None
 
         items = list(buffer)
-        if str(accumulator_node.get("class_name") or "").strip() == "__accumulator_stack__":
+        accumulator_class = str(accumulator_node.get("class_name") or "").strip()
+        if accumulator_class == "__accumulator_queue__":
+            items.sort(key=self._accumulator_item_order)
+        if accumulator_class == "__accumulator_stack__":
             items.reverse()
 
         buffer.clear()
         release_mode = str(config.get("release_mode") or "array").strip().lower()
         if release_mode == "concatenated":
             separator = str(config.get("separator") if config.get("separator") is not None else "\n")
-            return separator.join(self._stringify_accumulator_item(item) for item in items)
-        return copy.deepcopy(items)
+            return separator.join(
+                self._stringify_accumulator_item(self._accumulator_item_value(item))
+                for item in items
+            )
+        return copy.deepcopy([self._accumulator_item_value(item) for item in items])
 
     def _refresh_workflow_accumulators(
         self,
@@ -984,7 +1043,9 @@ class _SubjectiveDataSourcePipelineRunner:
             raw_inputs = accumulator_node.get("inputs", {}) or {}
             markers = self._accumulator_last_markers.setdefault(accumulator_node_id, {})
             pending_items: List[Any] = []
-            for port_name, index, raw_value in self._iter_accumulator_raw_values(raw_inputs):
+            for raw_order, (port_name, index, raw_value) in enumerate(
+                self._iter_accumulator_raw_values(raw_inputs)
+            ):
                 ref_key = f"{port_name}:{index}"
                 marker = self._accumulator_reference_marker(raw_value, results)
                 if marker is None or markers.get(ref_key) == marker:
@@ -993,7 +1054,16 @@ class _SubjectiveDataSourcePipelineRunner:
                 if resolved in (None, _SKIP_PIPELINE_INPUT, _SKIP_PIPELINE_NODE):
                     continue
                 markers[ref_key] = marker
-                pending_items.append(copy.deepcopy(resolved))
+                if not self._accumulator_filter_allows(
+                    accumulator_node_id,
+                    accumulator_node,
+                    port_name=port_name,
+                    index=index,
+                    raw_value=raw_value,
+                    resolved=resolved,
+                ):
+                    continue
+                pending_items.append(self._make_accumulator_buffer_item(raw_order, resolved))
 
             if pending_items:
                 self._accumulator_buffers.setdefault(accumulator_node_id, []).extend(pending_items)
@@ -1239,6 +1309,7 @@ class _SubjectiveDataSourcePipelineRunner:
                         "class_name": cls,
                         "inputs": raw_inputs,
                         "dependencies": self._extract_dependencies(raw_inputs, known_node_ids=known_node_ids),
+                        "filter_expr": str(raw_node.get("filter") or ""),
                         "config": normalize_pipeline_accumulator_config(
                             raw_node.get("internal_data") if isinstance(raw_node.get("internal_data"), dict) else {}
                         ),
@@ -2418,6 +2489,80 @@ class _SubjectiveDataSourcePipelineRunner:
     def _get_downstream_nodes(self, source_node_id: str) -> List[_V2PipelineNode]:
         return [node for node in self.nodes.values() if source_node_id in node.dependencies]
 
+    def _iter_direct_input_references(self, raw_value: Any) -> List[tuple[str, str]]:
+        refs: List[tuple[str, str]] = []
+        if isinstance(raw_value, dict):
+            if "from" in raw_value:
+                refs.extend(self._iter_direct_input_references(raw_value.get("from")))
+            else:
+                for child in raw_value.values():
+                    refs.extend(self._iter_direct_input_references(child))
+            return refs
+        if isinstance(raw_value, list):
+            for child in raw_value:
+                refs.extend(self._iter_direct_input_references(child))
+            return refs
+        if not isinstance(raw_value, str):
+            return refs
+
+        source_ref = str(raw_value or "").strip()
+        if "." not in source_ref or source_ref.startswith("$"):
+            return refs
+        source_node_id, field_name = source_ref.split(".", 1)
+        refs.append((source_node_id.strip(), field_name.strip()))
+        return refs
+
+    def _referenced_artifact_basenames(self, result: Any, allowed_ports: set[str]) -> set[str]:
+        basenames: set[str] = set()
+        if not isinstance(result, dict):
+            return basenames
+        for raw_port_name, value in result.items():
+            safe_port_name = self._sanitize_port_file_name(raw_port_name)
+            if safe_port_name not in allowed_ports:
+                continue
+            if isinstance(value, str):
+                basename = os.path.basename(value)
+                if basename:
+                    basenames.add(basename)
+        return basenames
+
+    def _get_file_routing_targets(self, source_node_id: str, result: Any) -> List[Dict[str, Any]]:
+        targets: List[Dict[str, Any]] = []
+        for node in self.nodes.values():
+            wildcard = False
+            allowed_ports: set[str] = set()
+            for raw_input in (node.inputs or {}).values():
+                for ref_source_node_id, field_name in self._iter_direct_input_references(raw_input):
+                    if ref_source_node_id != source_node_id:
+                        continue
+                    if field_name == "*":
+                        wildcard = True
+                        break
+                    safe_field_name = self._sanitize_port_file_name(field_name)
+                    if safe_field_name:
+                        allowed_ports.add(safe_field_name)
+                if wildcard:
+                    break
+            if not wildcard and not allowed_ports:
+                continue
+            targets.append(
+                {
+                    "node": node,
+                    "ports": None if wildcard else allowed_ports,
+                    "artifacts": set() if wildcard else self._referenced_artifact_basenames(result, allowed_ports),
+                }
+            )
+        return targets
+
+    def _original_output_file_name(self, node: _V2PipelineNode, file_name: str) -> str:
+        split_name = self._split_stamped_output_name(node, file_name)
+        return split_name[1] if split_name else file_name
+
+    def _output_file_port_name(self, node: _V2PipelineNode, file_name: str) -> str:
+        original_file_name = self._original_output_file_name(node, file_name)
+        stem, _ = os.path.splitext(original_file_name)
+        return self._sanitize_port_file_name(stem)
+
     def _unique_destination(self, directory: str, file_name: str) -> str:
         base_name, extension = os.path.splitext(file_name)
         candidate = os.path.join(directory, file_name)
@@ -2447,16 +2592,17 @@ class _SubjectiveDataSourcePipelineRunner:
         if not files:
             return
 
-        downstream_nodes = self._get_downstream_nodes(node.node_id)
-        has_downstream = bool(downstream_nodes)
-        downstream_ids = [n.node_id for n in downstream_nodes]
+        execution_downstream_nodes = self._get_downstream_nodes(node.node_id)
+        has_execution_downstream = bool(execution_downstream_nodes)
+        routing_targets = self._get_file_routing_targets(node.node_id, result)
+        downstream_ids = [target["node"].node_id for target in routing_targets]
         BBLogger.log(
             f"[Pipeline:io] {node.node_id} routing {len(files)} file(s) from output/: "
             f"{files} → downstream={downstream_ids} send_to_context={node.send_to_context}"
         )
 
-        if node.send_to_context or not has_downstream:
-            action = "move" if not has_downstream else "copy"
+        if node.send_to_context or not has_execution_downstream:
+            action = "move" if not has_execution_downstream else "copy"
             BBLogger.log(
                 f"[Pipeline:io] {node.node_id} promoting {len(files)} file(s) to context ({action})"
             )
@@ -2464,22 +2610,38 @@ class _SubjectiveDataSourcePipelineRunner:
                 node,
                 files,
                 output_dir,
-                move_files=not has_downstream,
+                move_files=not has_execution_downstream,
                 result=result,
                 written_port_files=written_port_files,
                 batch_stamp=batch_stamp,
             )
-            if not has_downstream:
+            if not has_execution_downstream:
                 return
 
         files = sorted(name for name in files if os.path.isfile(os.path.join(output_dir, name)))
         if not files:
             return
+        if not routing_targets:
+            for file_name in files:
+                source_path = os.path.join(output_dir, file_name)
+                if os.path.isfile(source_path):
+                    os.remove(source_path)
+            return
 
         for file_name in files:
             source_path = os.path.join(output_dir, file_name)
+            original_file_name = self._original_output_file_name(node, file_name)
+            port_name = self._output_file_port_name(node, file_name)
             destinations = []
-            for downstream_node in downstream_nodes:
+            for target in routing_targets:
+                downstream_node = target["node"]
+                allowed_ports = target["ports"]
+                allowed_artifacts = target["artifacts"]
+                if allowed_ports is not None:
+                    port_allowed = bool(port_name) and port_name in allowed_ports
+                    artifact_allowed = original_file_name in allowed_artifacts
+                    if not port_allowed and not artifact_allowed:
+                        continue
                 input_dir, _, _ = self._ensure_node_dirs(downstream_node.node_id)
                 destinations.append(
                     self._unique_destination(
@@ -2495,10 +2657,17 @@ class _SubjectiveDataSourcePipelineRunner:
             if len(destinations) == 1:
                 shutil.move(source_path, destinations[0])
                 continue
+            if not destinations:
+                continue
 
             for destination in destinations[:-1]:
                 shutil.copy2(source_path, destination)
             shutil.move(source_path, destinations[-1])
+
+        for file_name in sorted(os.listdir(output_dir)):
+            source_path = os.path.join(output_dir, file_name)
+            if os.path.isfile(source_path):
+                os.remove(source_path)
 
 
 class SubjectivePipelineDataSource(SubjectiveDataSource):
