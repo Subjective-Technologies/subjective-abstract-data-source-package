@@ -21,7 +21,6 @@ import tempfile
 import threading
 import time
 import traceback
-import uuid
 from typing import Any, Callable, Dict, List, Optional
 
 from brainboost_data_source_logger_package.BBLogger import BBLogger
@@ -606,11 +605,7 @@ class _SubjectiveDataSourcePipelineRunner:
         self.pipeline_config = pipeline_config or {}
         self.context_dir = context_dir or tempfile.mkdtemp(prefix="subjective_pipeline_context_")
         self.tmp_root = tmp_root or tempfile.gettempdir()
-        self.workspace_root = os.path.join(
-            self.tmp_root,
-            "pipeline_runs",
-            f"{self.pipeline_name}_{uuid.uuid4().hex[:8]}",
-        )
+        self.workspace_root = self.tmp_root
         self.nodes: Dict[str, _V2PipelineNode] = {}
         self._connection_records = self._load_connection_records()
         self._started = False
@@ -1195,25 +1190,122 @@ class _SubjectiveDataSourcePipelineRunner:
                     results,
                     reset_workflow_cycle=False,
                 )
+                self._write_pipeline_level_context(results)
 
         return self._finalize_results(results)
 
     def _load_connection_records(self) -> Dict[str, Dict[str, Any]]:
+        records: Dict[str, Dict[str, Any]] = {}
         try:
             from com_subjective_session.ConnectionPersistor import ConnectionPersistor
 
             persistor = ConnectionPersistor()
-            records = {}
             for item in persistor.load_connections():
                 if not isinstance(item, dict):
                     continue
                 name = str(item.get("connection_name") or "").strip()
                 if name:
                     records[name] = item
-            return records
         except Exception as exc:
             BBLogger.log(f"Pipeline runner could not load persisted connections: {exc}")
-            return {}
+
+        for name, embedded_record in self._load_embedded_connection_records(records).items():
+            records[name] = embedded_record
+        return records
+
+    def _embedded_connection_passphrase(self) -> str:
+        for key in (
+            "embedded_connections_passphrase",
+            "pipeline_passphrase",
+            "pipeline_embedded_connections_passphrase",
+        ):
+            value = str(self.pipeline_config.get(key) or "").strip()
+            if value:
+                return value
+        for env_key in (
+            "SUBJECTIVE_PIPELINE_EMBEDDED_CONNECTIONS_PASSPHRASE",
+            "SUBJECTIVE_PIPELINE_PASSPHRASE",
+        ):
+            value = str(os.environ.get(env_key, "") or "").strip()
+            if value:
+                return value
+        return ""
+
+    def _embedded_connection_has_placeholder(self, value: Any) -> bool:
+        from com_subjective_session.ConnectionPersistor import INPUT_CREDENTIALS_SENTINEL
+
+        if isinstance(value, dict):
+            return any(self._embedded_connection_has_placeholder(child) for child in value.values())
+        if isinstance(value, list):
+            return any(self._embedded_connection_has_placeholder(child) for child in value)
+        return str(value) == INPUT_CREDENTIALS_SENTINEL
+
+    def _load_embedded_connection_records(
+        self,
+        persisted_records: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        embedded_records: Dict[str, Dict[str, Any]] = {}
+        plain_entries = []
+        for entry in self.pipeline_config.get("embedded_connections", []) or []:
+            if isinstance(entry, dict):
+                plain_entries.append(copy.deepcopy(entry))
+
+        encryption_block = self.pipeline_config.get("embedded_connections_encryption")
+        encrypted_lookup: Dict[str, Dict[str, Any]] = {}
+        if isinstance(encryption_block, dict):
+            try:
+                from com_subjective_session.ConnectionPersistor import ConnectionPersistor
+
+                passphrase = self._embedded_connection_passphrase()
+                if passphrase:
+                    decrypted = ConnectionPersistor.decrypt_json_with_passphrase(
+                        encryption_block,
+                        passphrase,
+                    )
+                    encrypted_connections = (
+                        decrypted.get("connections")
+                        if isinstance(decrypted, dict)
+                        else []
+                    )
+                    if isinstance(encrypted_connections, list):
+                        for entry in encrypted_connections:
+                            if not isinstance(entry, dict):
+                                continue
+                            connection_name = str(entry.get("connection_name") or "").strip()
+                            connection_data = entry.get("connection_data")
+                            if connection_name and isinstance(connection_data, dict):
+                                encrypted_lookup[connection_name] = copy.deepcopy(connection_data)
+                else:
+                    BBLogger.log(
+                        "[Pipeline:embedded] Encrypted embedded connections present but no passphrase was provided."
+                    )
+            except Exception as exc:
+                BBLogger.log(f"[Pipeline:embedded] Failed to decrypt embedded connections: {exc}")
+
+        persisted_records = persisted_records or {}
+        for entry in plain_entries:
+            connection_name = str(entry.get("connection_name") or "").strip()
+            if not connection_name:
+                continue
+
+            merged_entry = copy.deepcopy(entry)
+            connection_data = merged_entry.get("connection_data")
+            if not isinstance(connection_data, dict):
+                connection_data = {}
+                merged_entry["connection_data"] = connection_data
+            if connection_name in encrypted_lookup:
+                connection_data.update(copy.deepcopy(encrypted_lookup[connection_name]))
+
+            if not bool(merged_entry.get("credentials_included")):
+                persisted = persisted_records.get(connection_name) or {}
+                persisted_connection_data = persisted.get("connection_data")
+                if isinstance(persisted_connection_data, dict):
+                    for key, value in persisted_connection_data.items():
+                        if key not in connection_data or self._embedded_connection_has_placeholder(connection_data.get(key)):
+                            connection_data[key] = copy.deepcopy(value)
+
+            embedded_records[connection_name] = merged_entry
+        return embedded_records
 
     def _build_nodes(self):
         nodes = self.pipeline_config.get("nodes", [])
@@ -2217,6 +2309,31 @@ class _SubjectiveDataSourcePipelineRunner:
             return batch_stamp.rsplit("_", 1)[0]
         return datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
 
+    def _write_pipeline_level_context(self, results: Dict[str, Any]) -> None:
+        """Write an aggregate pipeline-level context file after each event-driven batch cycle."""
+        try:
+            if not self.context_dir:
+                return
+            os.makedirs(self.context_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+            filename = SubjectiveDataSource.build_context_filename(
+                datasource_name="Pipeline",
+                connection_label=SubjectiveDataSource.sanitize_context_label(
+                    self.pipeline_name or "pipeline"
+                ),
+                output_format="json",
+                timestamp=timestamp,
+            )
+            payload = {"pipeline_result": self._finalize_results(dict(results))}
+            context_path = os.path.join(self.context_dir, filename)
+            with open(context_path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2, ensure_ascii=False, default=str)
+            BBLogger.log(
+                f"[Pipeline:context] Wrote pipeline-level context: {filename}"
+            )
+        except Exception as exc:
+            BBLogger.log(f"[Pipeline:context] Failed to write pipeline-level context: {exc}")
+
     def _coerce_result_payload(self, result: Any) -> Dict[str, Any] | None:
         if result is None:
             return None
@@ -2681,7 +2798,7 @@ class SubjectivePipelineDataSource(SubjectiveDataSource):
 
     def run(self, request: dict) -> Any:
         self._load_pipeline_config()
-        if str(self.pipeline_config.get("version") or "").strip() == "2":
+        if str(self.pipeline_config.get("version") or "").strip() in {"2", "3"}:
             try:
                 BBLogger.log(f"[Pipeline] Creating V2 runner for pipeline '{self.pipeline_name}'")
                 runner = _SubjectiveDataSourcePipelineRunner(
