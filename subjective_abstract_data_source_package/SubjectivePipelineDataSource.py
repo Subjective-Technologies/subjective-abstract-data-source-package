@@ -617,6 +617,9 @@ class _SubjectiveDataSourcePipelineRunner:
         self._accumulator_buffers: Dict[str, List[Any]] = {}
         self._accumulator_last_markers: Dict[str, Dict[str, Any]] = {}
         self._node_result_versions: Dict[str, int] = {}
+        self._pending_context_references: Dict[str, List[Dict[str, Any]]] = {}
+        self._pipeline_cycle_context_references: List[Dict[str, Any]] = []
+        self._context_reference_lock = threading.Lock()
         self._stream_threads: List[threading.Thread] = []
         self._stop_event = threading.Event()
         self._build_nodes()
@@ -1064,15 +1067,25 @@ class _SubjectiveDataSourcePipelineRunner:
                 item,
                 batch_stamp=batch_stamp,
             )
-            self._route_output_files(
+            event_context_references = self._route_output_files(
                 node,
                 batch_stamp=batch_stamp,
                 result=item,
                 written_port_files=written_port_files,
             )
+            self._consume_pending_context_references(node.node_id)
             summary = list(item.keys()) if isinstance(item, dict) else type(item).__name__
             BBLogger.log(f"[Pipeline:event] Published stream event from {node.node_id}: {summary}")
-            event_queue.put(("event", node.node_id, item))
+            event_queue.put(
+                (
+                    "event",
+                    node.node_id,
+                    {
+                        "payload": item,
+                        "context_references": event_context_references,
+                    },
+                )
+            )
 
         def _stream_worker(node: _V2PipelineNode, stream_request: Dict[str, Any]) -> None:
             emitted_any = False
@@ -1172,7 +1185,13 @@ class _SubjectiveDataSourcePipelineRunner:
                 continue
 
             self._clear_accumulator_cycle_outputs(results)
-            results[source_node_id] = payload
+            event_payload = payload
+            event_context_references: List[Dict[str, Any]] = []
+            if isinstance(payload, dict) and "payload" in payload and "context_references" in payload:
+                event_payload = payload.get("payload")
+                event_context_references = list(payload.get("context_references") or [])
+
+            results[source_node_id] = event_payload
             self._bump_result_version(source_node_id)
             self._refresh_workflow_accumulators(results, changed_node_id=source_node_id)
             affected_batch_nodes = [
@@ -1190,7 +1209,13 @@ class _SubjectiveDataSourcePipelineRunner:
                     results,
                     reset_workflow_cycle=False,
                 )
+                cycle_context_references = list(event_context_references)
+                cycle_context_references.extend(self._consume_pending_context_references())
+                self._pipeline_cycle_context_references = self._dedupe_context_references(
+                    cycle_context_references
+                )
                 self._write_pipeline_level_context(results)
+                self._pipeline_cycle_context_references = []
 
         return self._finalize_results(results)
 
@@ -2314,6 +2339,15 @@ class _SubjectiveDataSourcePipelineRunner:
         try:
             if not self.context_dir:
                 return
+            context_references = self._dedupe_context_references(
+                list(self._pipeline_cycle_context_references or [])
+            )
+            if not context_references:
+                BBLogger.log(
+                    "[Pipeline:context] Skipping pipeline-level context write; "
+                    "no node context files were produced for this cycle."
+                )
+                return
             os.makedirs(self.context_dir, exist_ok=True)
             timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
             filename = SubjectiveDataSource.build_context_filename(
@@ -2324,12 +2358,22 @@ class _SubjectiveDataSourcePipelineRunner:
                 output_format="json",
                 timestamp=timestamp,
             )
-            payload = {"pipeline_result": self._finalize_results(dict(results))}
-            context_path = os.path.join(self.context_dir, filename)
+            payload = {
+                "pipeline": {
+                    "name": self.pipeline_name,
+                    "context_reference_count": len(context_references),
+                    "result_node_ids": [
+                        node.node_id for node in self.nodes.values() if node.send_to_context
+                    ] or ([self._topological_order()[-1]] if self.nodes else []),
+                },
+                "pipeline_result": self._finalize_results(dict(results)),
+                "context_references": context_references,
+            }
+            context_path = self._unique_destination(self.context_dir, filename)
             with open(context_path, "w", encoding="utf-8") as fh:
                 json.dump(payload, fh, indent=2, ensure_ascii=False, default=str)
             BBLogger.log(
-                f"[Pipeline:context] Wrote pipeline-level context: {filename}"
+                f"[Pipeline:context] Wrote pipeline-level context: {os.path.basename(context_path)}"
             )
         except Exception as exc:
             BBLogger.log(f"[Pipeline:context] Failed to write pipeline-level context: {exc}")
@@ -2511,6 +2555,64 @@ class _SubjectiveDataSourcePipelineRunner:
         original_file_name = split_name[1] if split_name else file_name
         return f"{stem}-{original_file_name}"
 
+    def _record_context_reference(
+        self,
+        node: _V2PipelineNode,
+        context_destination: str,
+        *,
+        timestamp: str,
+    ) -> Dict[str, Any]:
+        reference = {
+            "node_id": str(node.node_id or "").strip(),
+            "connection_name": str(node.connection_name or "").strip(),
+            "datasource_name": self._node_context_datasource_name(node),
+            "context_file": os.path.basename(context_destination),
+            "context_path": os.path.abspath(context_destination),
+            "timestamp": str(timestamp or "").strip(),
+        }
+        with self._context_reference_lock:
+            self._pending_context_references.setdefault(reference["node_id"], []).append(reference)
+        return reference
+
+    def _consume_pending_context_references(
+        self,
+        node_id: str | None = None,
+    ) -> List[Dict[str, Any]]:
+        with self._context_reference_lock:
+            if node_id is not None:
+                refs = list(self._pending_context_references.pop(str(node_id or "").strip(), []))
+            else:
+                refs = []
+                for key in list(self._pending_context_references.keys()):
+                    refs.extend(self._pending_context_references.pop(key, []))
+        return self._dedupe_context_references(refs)
+
+    def _dedupe_context_references(
+        self,
+        references: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        unique_refs: List[Dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for reference in references or []:
+            if not isinstance(reference, dict):
+                continue
+            context_path = str(reference.get("context_path") or "").strip()
+            context_file = str(reference.get("context_file") or "").strip()
+            node_id = str(reference.get("node_id") or "").strip()
+            key = (context_path or context_file, node_id)
+            if not key[0] or key in seen:
+                continue
+            seen.add(key)
+            unique_refs.append(reference)
+        unique_refs.sort(
+            key=lambda item: (
+                str(item.get("timestamp") or ""),
+                str(item.get("context_file") or ""),
+                str(item.get("node_id") or ""),
+            )
+        )
+        return unique_refs
+
     def _promote_output_files_to_context(
         self,
         node: _V2PipelineNode,
@@ -2521,11 +2623,12 @@ class _SubjectiveDataSourcePipelineRunner:
         result: Any = None,
         written_port_files: set[str] | None = None,
         batch_stamp: str | None = None,
-    ) -> None:
+    ) -> List[Dict[str, Any]]:
         os.makedirs(self.context_dir, exist_ok=True)
         timestamp = self._context_timestamp_for_batch(batch_stamp)
         payload = self._coerce_result_payload(result)
         written_port_files = set(written_port_files or set())
+        context_references: List[Dict[str, Any]] = []
 
         if payload is not None:
             context_destination = self._unique_destination(
@@ -2534,6 +2637,13 @@ class _SubjectiveDataSourcePipelineRunner:
             )
             with open(context_destination, "w", encoding="utf-8") as fh:
                 json.dump(payload, fh, indent=2, ensure_ascii=False, default=str)
+            context_references.append(
+                self._record_context_reference(
+                    node,
+                    context_destination,
+                    timestamp=timestamp,
+                )
+            )
             BBLogger.log(
                 f"[Pipeline:io] {node.node_id} wrote context file: {os.path.basename(context_destination)}"
             )
@@ -2558,6 +2668,7 @@ class _SubjectiveDataSourcePipelineRunner:
                 source_path = os.path.join(output_dir, file_name)
                 if os.path.isfile(source_path):
                     os.remove(source_path)
+        return context_references
 
     def _get_downstream_nodes(self, source_node_id: str) -> List[_V2PipelineNode]:
         return [node for node in self.nodes.values() if source_node_id in node.dependencies]
@@ -2652,10 +2763,11 @@ class _SubjectiveDataSourcePipelineRunner:
         batch_stamp: str | None = None,
         result: Any = None,
         written_port_files: set[str] | None = None,
-    ):
+    ) -> List[Dict[str, Any]]:
         _, output_dir, _ = self._ensure_node_dirs(node.node_id)
+        context_references: List[Dict[str, Any]] = []
         if not os.path.isdir(output_dir):
-            return
+            return context_references
         if batch_stamp:
             files = self._normalize_output_batch_files(node, output_dir, batch_stamp)
         else:
@@ -2663,7 +2775,7 @@ class _SubjectiveDataSourcePipelineRunner:
                 name for name in os.listdir(output_dir) if os.path.isfile(os.path.join(output_dir, name))
             )
         if not files:
-            return
+            return context_references
 
         execution_downstream_nodes = self._get_downstream_nodes(node.node_id)
         has_execution_downstream = bool(execution_downstream_nodes)
@@ -2679,7 +2791,7 @@ class _SubjectiveDataSourcePipelineRunner:
             BBLogger.log(
                 f"[Pipeline:io] {node.node_id} promoting {len(files)} file(s) to context ({action})"
             )
-            self._promote_output_files_to_context(
+            context_references = self._promote_output_files_to_context(
                 node,
                 files,
                 output_dir,
@@ -2689,17 +2801,17 @@ class _SubjectiveDataSourcePipelineRunner:
                 batch_stamp=batch_stamp,
             )
             if not has_execution_downstream:
-                return
+                return context_references
 
         files = sorted(name for name in files if os.path.isfile(os.path.join(output_dir, name)))
         if not files:
-            return
+            return context_references
         if not routing_targets:
             for file_name in files:
                 source_path = os.path.join(output_dir, file_name)
                 if os.path.isfile(source_path):
                     os.remove(source_path)
-            return
+            return context_references
 
         for file_name in files:
             source_path = os.path.join(output_dir, file_name)
@@ -2741,6 +2853,7 @@ class _SubjectiveDataSourcePipelineRunner:
             source_path = os.path.join(output_dir, file_name)
             if os.path.isfile(source_path):
                 os.remove(source_path)
+        return context_references
 
 
 class SubjectivePipelineDataSource(SubjectiveDataSource):
