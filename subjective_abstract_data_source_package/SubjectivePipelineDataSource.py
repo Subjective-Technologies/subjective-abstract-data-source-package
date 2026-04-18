@@ -643,7 +643,7 @@ class _SubjectiveDataSourcePipelineRunner:
         BBLogger.log(f"[Pipeline:build] Creating workspace at {self.workspace_root}")
         os.makedirs(self.workspace_root, exist_ok=True)
         for node in self.nodes.values():
-            self._ensure_node_dirs(node.node_id)
+            self._reset_node_dirs(node.node_id)
             if node.instance is None:
                 class_name = getattr(node.data_source_class, "__name__", str(node.data_source_class))
                 try:
@@ -730,7 +730,8 @@ class _SubjectiveDataSourcePipelineRunner:
         initial_request: Dict[str, Any],
         results: Dict[str, Any],
         reset_workflow_cycle: bool = True,
-    ) -> None:
+    ) -> List[str]:
+        executed_node_ids: List[str] = []
         if reset_workflow_cycle:
             self._clear_accumulator_cycle_outputs(results)
         for node_id in node_order:
@@ -791,6 +792,8 @@ class _SubjectiveDataSourcePipelineRunner:
             )
             self._bump_result_version(node_id)
             self._refresh_workflow_accumulators(results, changed_node_id=node_id)
+            executed_node_ids.append(node_id)
+        return executed_node_ids
 
     def _finalize_results(self, results: Dict[str, Any]):
         result_nodes = [n.node_id for n in self.nodes.values() if n.send_to_context]
@@ -1203,12 +1206,24 @@ class _SubjectiveDataSourcePipelineRunner:
                 BBLogger.log(
                     f"[Pipeline:event] {source_node_id} triggered downstream batch nodes: {affected_batch_nodes}"
                 )
-                self._run_batch_nodes(
-                    affected_batch_nodes,
-                    initial_request,
-                    results,
-                    reset_workflow_cycle=False,
-                )
+                pending_batch_nodes = list(affected_batch_nodes)
+                while pending_batch_nodes:
+                    executed_batch_nodes = self._run_batch_nodes(
+                        pending_batch_nodes,
+                        initial_request,
+                        results,
+                        reset_workflow_cycle=False,
+                    )
+                    if not executed_batch_nodes:
+                        break
+                    pending_batch_nodes = [
+                        node_id
+                        for node_id in batch_order
+                        if any(
+                            executed_node_id in dependency_map.get(node_id, set())
+                            for executed_node_id in executed_batch_nodes
+                        )
+                    ]
                 cycle_context_references = list(event_context_references)
                 cycle_context_references.extend(self._consume_pending_context_references())
                 self._pipeline_cycle_context_references = self._dedupe_context_references(
@@ -1533,6 +1548,26 @@ class _SubjectiveDataSourcePipelineRunner:
         os.makedirs(input_dir, exist_ok=True)
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(scratch_dir, exist_ok=True)
+        return input_dir, output_dir, scratch_dir
+
+    def _reset_node_dirs(self, node_id: str):
+        input_dir, output_dir, scratch_dir = self._ensure_node_dirs(node_id)
+        for folder in (input_dir, output_dir, scratch_dir):
+            try:
+                entries = os.listdir(folder)
+            except OSError:
+                continue
+            for entry in entries:
+                path = os.path.join(folder, entry)
+                try:
+                    if os.path.isdir(path):
+                        shutil.rmtree(path, ignore_errors=True)
+                    elif os.path.exists(path):
+                        os.remove(path)
+                except Exception as exc:
+                    BBLogger.log(
+                        f"[Pipeline:build] Could not remove stale workspace entry '{path}': {exc}"
+                    )
         return input_dir, output_dir, scratch_dir
 
     def _resolve_connection_data(self, connection_name: str) -> Dict[str, Any]:
