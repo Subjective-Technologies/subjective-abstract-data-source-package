@@ -30,8 +30,8 @@ test:
     - subjective_abstract_data_source_package.SubjectiveRealTimeDataSource
 
 about:
-  home: https://github.com/brainboost/subjective-abstract-data-source-package
+  home: https://github.com/Subjective-Technologies/subjective-abstract-data-source-package
   license: MIT
   summary: Abstract base classes for building data source addons for BrainBoost data pipelines
   doc_url: https://subjective-abstract-data-source-package.readthedocs.io/
-  dev_url: https://github.com/brainboost/subjective-abstract-data-source-package 
+  dev_url: https://github.com/Subjective-Technologies/subjective-abstract-data-source-package 

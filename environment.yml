@@ -6,6 +6,6 @@ dependencies:
   - pip
   - pandas>=1.5.0
   - pip:
-      - brainboost-data-source-logger-package @ git+ssh://git@github.com/PabloBorda/brainboost_data_source_logger_package.git
-      - brainboost-configuration-package @ git+ssh://git@github.com/PabloBorda/brainboost_configuration_package.git
+      - brainboost-data-source-logger-package @ git+ssh://git@github.com/Subjective-Technologies/brainboost_data_source_logger_package.git
+      - brainboost-configuration-package @ git+ssh://git@github.com/Subjective-Technologies/brainboost_configuration_package.git
       - alive-progress>=3.1.5

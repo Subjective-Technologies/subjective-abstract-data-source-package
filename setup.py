@@ -40,12 +40,14 @@ def read_requirements():
 setup(
     name="subjective-abstract-data-source-package",
     version=get_version(),
-    author="Pablo Tomas Borda",
+    author="Subjective Technologies",
     author_email="pablo.borda@subjectivetechnologies.com",
+    maintainer="Pablo Tomas Borda",
+    maintainer_email="pablo.borda@subjectivetechnologies.com",
     description="Subjective datasource v2 base classes with separated connection/request schemas and pipeline support",
     long_description=read_readme(),
     long_description_content_type="text/markdown",
-    url="https://github.com/brainboost/subjective-abstract-data-source-package",
+    url="https://github.com/Subjective-Technologies/subjective-abstract-data-source-package",
     packages=find_packages(),
     classifiers=[
         "Development Status :: 4 - Beta",
@@ -78,8 +80,8 @@ setup(
     },
     keywords="data-source, abstract, brainboost, pipeline, addon",
     project_urls={
-        "Bug Reports": "https://github.com/brainboost/subjective-abstract-data-source-package/issues",
-        "Source": "https://github.com/brainboost/subjective-abstract-data-source-package",
+        "Bug Reports": "https://github.com/Subjective-Technologies/subjective-abstract-data-source-package/issues",
+        "Source": "https://github.com/Subjective-Technologies/subjective-abstract-data-source-package",
         "Documentation": "https://subjective-abstract-data-source-package.readthedocs.io/",
     },
     include_package_data=True,

@@ -18,7 +18,7 @@ pip install subjective-abstract-data-source-package
 
 ### From source
 ```bash
-git clone https://github.com/brainboost/subjective-abstract-data-source-package.git
+git clone https://github.com/Subjective-Technologies/subjective-abstract-data-source-package.git
 cd subjective-abstract-data-source-package
 pip install -e .
 ```
@@ -167,7 +167,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 For support and questions:
 - Email: pablo.borda@subjectivetechnologies.com
-- Issues: [GitHub Issues](https://github.com/brainboost/subjective-abstract-data-source-package/issues)
+- Issues: [GitHub Issues](https://github.com/Subjective-Technologies/subjective-abstract-data-source-package/issues)
 - Documentation: [Read the Docs](https://subjective-abstract-data-source-package.readthedocs.io/)
 
 ## Changelog
