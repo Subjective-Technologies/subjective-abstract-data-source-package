@@ -593,6 +593,34 @@ _SKIP_PIPELINE_NODE = object()
 _SKIP_PIPELINE_INPUT = object()
 
 
+def _node_result_indicates_failure(result: Any) -> bool:
+    """Detect whether a node's result represents a failure.
+
+    Two conventions are recognised so the cascade-skip works regardless of
+    which plugin contract a datasource follows:
+
+    * ``success: False`` — the explicit convention used by ``_run_batch_nodes``'s
+      crash-containment wrapper and by datasources that have been migrated to
+      the v2 result contract.
+    * Non-empty ``error`` field with no contradicting ``success: True`` — the
+      legacy convention used by older plugins (e.g. ``SubjectiveJsonDataSource``
+      returns ``{"json": None, "text": "", "error": "<exc>"}`` on parse failure).
+    """
+    if not isinstance(result, dict):
+        return False
+    success = result.get("success")
+    if success is False:
+        return True
+    if success is True:
+        return False
+    error = result.get("error")
+    if isinstance(error, str) and error.strip():
+        return True
+    if error not in (None, "", [], {}):
+        return True
+    return False
+
+
 class _SubjectiveDataSourcePipelineRunner:
     def __init__(
         self,
@@ -772,11 +800,30 @@ class _SubjectiveDataSourcePipelineRunner:
                     execution_plan.get("request", {}),
                     input_dir_override=execution_plan.get("input_dir"),
                 )
-                result = self._execute_node(
-                    node,
-                    prepared_request,
-                    input_dir_override=execution_plan.get("input_dir"),
-                )
+                # Per-node crash containment. Long-running monitor pipelines
+                # (ticker → screenshot → … → episode rollup) MUST survive a
+                # single bad rollup so the upstream capture keeps producing
+                # atoms. ``_execute_node`` already logs the traceback before
+                # re-raising; here we convert the exception into a structured
+                # error result, store it, and let the loop continue. Downstream
+                # nodes see an empty payload and skip-by-input-resolution as
+                # they already do today; the stream worker keeps ticking.
+                try:
+                    result = self._execute_node(
+                        node,
+                        prepared_request,
+                        input_dir_override=execution_plan.get("input_dir"),
+                    )
+                except Exception as exc:
+                    BBLogger.log(
+                        f"[Pipeline:batch] {node_id} raised {type(exc).__name__}: {exc} "
+                        f"— recorded as error result; pipeline continues."
+                    )
+                    result = {
+                        "success": False,
+                        "error": str(exc),
+                        "error_type": type(exc).__name__,
+                    }
                 execution_results.append(result)
 
             if iteration_specs:
@@ -2001,6 +2048,23 @@ class _SubjectiveDataSourcePipelineRunner:
                 f"source node '{source_node_id}' has no result yet → None"
             )
             return None
+        # System-level cascade containment: if the upstream node reported a
+        # failure (either explicit ``success: False`` from a plugin like our
+        # _execute_node wrapper, or a non-empty ``error`` field used by
+        # datasources like SubjectiveJsonDataSource on parse failure), do NOT
+        # forward its empty/garbage outputs to downstream. Returning the skip
+        # sentinel makes downstream "skip by input resolution" — the same path
+        # the runner already uses when an upstream produces no result at all.
+        # Without this, a node that returned ``{"json": None, "text": "", "error": "..."}``
+        # would feed ``text=""`` into a SubjectiveTextDataSource and crash it.
+        if _node_result_indicates_failure(source_value):
+            BBLogger.log(
+                f"[Pipeline:resolve] {node.node_id} input '{raw_value}': "
+                f"upstream '{source_node_id}' reported failure "
+                f"(success={source_value.get('success')!r}, error={str(source_value.get('error') or '')[:60]!r}) "
+                f"→ skip"
+            )
+            return _SKIP_PIPELINE_INPUT
         if field_name == "*":
             resolved = self._remap_result_files(node, source_node_id, source_value)
             BBLogger.log(
