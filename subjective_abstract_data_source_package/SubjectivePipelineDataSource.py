@@ -2301,6 +2301,29 @@ class _SubjectiveDataSourcePipelineRunner:
             )
         return result
 
+    def _emit_node_event(self, node: "_V2PipelineNode", status: str, error: str = "") -> None:
+        """Report node-level run state to an optional callback (job trace, Track 4).
+
+        The launcher sets ``node_event_callback`` when running under a ledger
+        job so LocalJobRunner writes ``job_node_runs`` rows. No callback (plain
+        connection runs) => this is a cheap no-op. Never raises: a trace hiccup
+        must not affect pipeline execution.
+        """
+        callback = getattr(self, "node_event_callback", None)
+        if not callable(callback):
+            return
+        try:
+            callback(
+                {
+                    "node_id": getattr(node, "node_id", None),
+                    "node_class": getattr(node, "class_name", None),
+                    "node_status": status,
+                    "error": error or None,
+                }
+            )
+        except Exception:  # noqa: BLE001 - node trace is strictly best-effort
+            pass
+
     def _execute_node(
         self,
         node: _V2PipelineNode,
@@ -2322,6 +2345,7 @@ class _SubjectiveDataSourcePipelineRunner:
             original_input_dir = config.get("input_dir")
             config["input_dir"] = input_dir_override
 
+        self._emit_node_event(node, "running")
         try:
             BBLogger.log(
                 f"[Pipeline:execute] Running {node.node_id} "
@@ -2392,10 +2416,12 @@ class _SubjectiveDataSourcePipelineRunner:
                 BBLogger.log(
                     f"[Pipeline:execute] {node.node_id} completed with result type={type(result).__name__}"
                 )
+            self._emit_node_event(node, "succeeded")
         except Exception as exc:
             BBLogger.log(
                 f"[Pipeline:execute] {node.node_id} failed: {exc}\n{traceback.format_exc()}"
             )
+            self._emit_node_event(node, "failed", error=str(exc))
             raise
         finally:
             if input_dir_override and isinstance(getattr(node.instance, "_config", None), dict):
