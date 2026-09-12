@@ -1,5 +1,13 @@
 # AGENTS.md
 
+Parent workspace workflow (do not replace with a local prompt):
+
+1. `/subjective/AGENTS.md`
+2. `/subjective/workflow/AGENTS.md`
+3. `/subjective/workflow/WORKSPACE.md`
+
+This file is the **datasource class contract only**.
+
 ## Purpose
 
 This repository defines the base contracts for BrainBoost data sources. When an LLM agent is asked to create or update a data source, treat this file as the implementation contract.
