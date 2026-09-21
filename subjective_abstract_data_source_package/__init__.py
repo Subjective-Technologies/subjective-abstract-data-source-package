@@ -15,6 +15,7 @@ from .SubjectiveRealTimeDataSource import SubjectiveRealTimeDataSource
 from .SubjectiveOnDemandDataSource import SubjectiveOnDemandDataSource
 from .SubjectivePipelineDataSource import SubjectiveDataSourcePipeline, PipelineNode, PipelineAdapter
 from .SubjectivePipelineDataSource import SubjectivePipelineDataSource
+from .command_runner import CommandRunner, LocalRunner, runner_from
 
 __version__ = "2.0.0"
 __author__ = "Pablo Tomas Borda"
@@ -27,5 +28,8 @@ __all__ = [
     "SubjectiveDataSourcePipeline",
     "PipelineNode",
     "PipelineAdapter",
-    "SubjectivePipelineDataSource"
+    "SubjectivePipelineDataSource",
+    "CommandRunner",
+    "LocalRunner",
+    "runner_from"
 ] 
